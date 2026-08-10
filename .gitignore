@@ -1,0 +1,27 @@
+# Machine-local state.  None of this is source, and some of it is a
+# CREDENTIAL - the browser profile and the session file are the Divya Bhaskar
+# login.  They are created on the spot on whatever machine runs the app.
+data/
+
+# Belt and braces: even if data/ ever moves, these must never be committed.
+**/browser_profile/
+divyabhaskar_session.txt
+divyabhaskar_autologin.json
+network_proxy.txt
+*.log
+
+# Bytecode caches, in every folder.  Normal runs write these to the machine
+# cache instead (LOCALAPPDATA/PublicNoticeExtractor); a test run or a tool can
+# still leave one behind, and closing the app sweeps them.
+__pycache__/
+**/__pycache__/
+*.py[cod]
+
+# Environments, editors, OS
+*.egg-info/
+.venv/
+venv/
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
