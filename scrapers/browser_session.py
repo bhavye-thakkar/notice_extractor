@@ -191,6 +191,7 @@ class BrowserSession:
 
     def _launch(self, channel: str):
         """A persistent context, so cookies + login outlive the process."""
+        config.migrate_browser_profile()      # from data/, if still there
         os.makedirs(self._profile_dir, exist_ok=True)
         options: Dict[str, object] = dict(
             user_data_dir=self._profile_dir,

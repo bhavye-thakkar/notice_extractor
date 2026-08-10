@@ -99,7 +99,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple, Type
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, scrolledtext
 import tkinter.font as tkfont
 
 # --- package modules (no third-party imports, so they are always safe) -------
@@ -1532,6 +1532,61 @@ def ensure_tesseract(line_callback: Callable[[str], None]) -> bool:
     return False
 
 
+#: The optional Windows component that teaches Windows.Media.Ocr Gujarati.
+WINDOWS_GUJ_OCR_CAPABILITY = "Language.OCR~~~gu-IN~0.0.1.0"
+
+
+def windows_gujarati_ocr_ready() -> bool:
+    """Can the built-in Windows OCR read Gujarati right now?"""
+    if not sys.platform.startswith("win"):
+        return False
+    try:
+        modules = WindowsOcrEngine._import_winsdk()
+        if modules is None:
+            return False
+        ocr_mod, lang_cls, _i, _s = modules
+        return bool(ocr_mod.OcrEngine.is_language_supported(lang_cls("gu")))
+    except Exception:
+        return False
+
+
+def install_windows_gujarati_ocr(
+        line_callback: Callable[[str], None]) -> bool:
+    """Install the Gujarati OCR pack.
+
+    This is the one component that genuinely needs administrator rights, so
+    it asks Windows for them (a UAC prompt) instead of printing a DISM
+    command for the user to run by hand.  Optional either way: Tesseract
+    reads Gujarati without any of this."""
+    if not sys.platform.startswith("win"):
+        line_callback("  not applicable (not Windows)")
+        return False
+    if windows_gujarati_ocr_ready():
+        line_callback("  Windows OCR already reads Gujarati.")
+        return True
+    line_callback("  asking Windows for administrator rights (UAC prompt)...")
+    inner = (f"Add-WindowsCapability -Online -Name {WINDOWS_GUJ_OCR_CAPABILITY}"
+             " -ErrorAction Stop")
+    command = (
+        "$p = Start-Process powershell -Verb RunAs -Wait -PassThru "
+        "-ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-Command',"
+        f"'{inner}'; exit $p.ExitCode")
+    code = _run_streamed(
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+         "-Command", command], line_callback)
+    reset_ocr_engine_cache()
+    if windows_gujarati_ocr_ready():
+        line_callback("  Windows OCR now reads Gujarati.")
+        return True
+    if code != 0:
+        line_callback("  the elevated install did not complete (UAC "
+                      "declined, or Windows Update is unavailable).")
+    line_callback("  manual route: Settings > Time & Language > Language & "
+                  "Region > Add ગુજરાતી > Language options > install the "
+                  "optional OCR component.")
+    return False
+
+
 def ensure_browser(line_callback: Callable[[str], None]) -> bool:
     """Make sure a driveable browser exists for the automated session.
 
@@ -1601,6 +1656,141 @@ def pip_install_dependencies(line_callback: Callable[[str], None],
     except Exception as exc:
         line_callback(f"Installer error: {exc}")
         done_callback(1)
+
+
+@dataclass
+class SetupComponent:
+    """One installable piece of the stack, for the Downloads window.
+
+    Everything the app can install is described here ONCE, so the dialog, the
+    'install everything' button and the status report cannot drift apart."""
+    key: str
+    name: str
+    required: bool
+    detail: str                                   # what it is for
+    instructions: str                             # the manual route
+    probe: Callable[[], Tuple[bool, str]]         # -> (ready?, status text)
+    install: Optional[Callable[[Callable[[str], None]], bool]]
+
+
+def _probe_pip_packages() -> Tuple[bool, str]:
+    """Which pip packages are importable (import name, not project name)."""
+    import importlib.util
+    wanted = [("opencv-python", "cv2"), ("numpy", "numpy"),
+              ("pillow", "PIL"), ("pymupdf", "pymupdf"),
+              ("pytesseract", "pytesseract"), ("playwright", "playwright")]
+    if sys.platform.startswith("win"):
+        wanted.append(("pycryptodome", "Crypto"))
+    missing = [name for name, module in wanted
+               if importlib.util.find_spec(module) is None]
+    if missing:
+        return False, "missing: " + ", ".join(missing)
+    return True, f"all {len(wanted)} packages installed"
+
+
+def _probe_browser() -> Tuple[bool, str]:
+    try:
+        from .scrapers.browser_session import (browser_ready,
+                                               default_browser_channel)
+    except Exception as exc:
+        return False, f"unavailable ({exc})"
+    if not browser_ready():
+        return False, "no driveable browser yet"
+    channel = default_browser_channel()
+    return True, f"ready ({channel or 'Playwright Chromium'})"
+
+
+def _probe_tesseract() -> Tuple[bool, str]:
+    binary = TesseractOcrEngine.find_binary()
+    return (True, binary) if binary else (False, "not installed")
+
+
+def _probe_traineddata() -> Tuple[bool, str]:
+    path = os.path.join(local_tessdata_dir(), "guj.traineddata")
+    if os.path.isfile(path) and os.path.getsize(path) > 100_000:
+        return True, f"{os.path.getsize(path):,} bytes"
+    return False, "not downloaded"
+
+
+def _probe_windows_guj() -> Tuple[bool, str]:
+    if not sys.platform.startswith("win"):
+        return True, "n/a (not Windows)"
+    if WindowsOcrEngine._import_winsdk() is None:
+        return False, "winrt bindings not installed"
+    return ((True, "Windows OCR reads Gujarati")
+            if windows_gujarati_ocr_ready()
+            else (False, "installed, without the Gujarati pack"))
+
+
+def _probe_easyocr() -> Tuple[bool, str]:
+    langs = EasyOcrEngine.available_langs()
+    if langs is None:
+        return False, "not installed"
+    return True, ("with Gujarati" if "gu" in langs
+                  else "installed (no Gujarati model upstream)")
+
+
+def _install_pip(line_callback: Callable[[str], None]) -> bool:
+    code = _run_streamed([sys.executable, "-m", "pip", "install", "--upgrade",
+                          *all_pip_packages()], line_callback)
+    return code == 0
+
+
+def _install_easyocr(line_callback: Callable[[str], None]) -> bool:
+    line_callback("  note: easyocr pulls in torch (~2 GB) and ships no "
+                  "Gujarati model - Tesseract is the better answer here.")
+    return _run_streamed([sys.executable, "-m", "pip", "install", "easyocr"],
+                         line_callback) == 0
+
+
+def setup_components() -> List[SetupComponent]:
+    """Everything the Downloads window can check and install."""
+    return [
+        SetupComponent(
+            "pip", "Python packages", True,
+            "OpenCV, NumPy, Pillow, PyMuPDF, pytesseract, Playwright - the "
+            "libraries the app itself is built on.",
+            "pip install " + " ".join(all_pip_packages()),
+            _probe_pip_packages, _install_pip),
+        SetupComponent(
+            "browser", "Automation browser", True,
+            "Chromium for Playwright.  Divya Bhaskar's viewer only hands "
+            "over its page list and access token to a real browser; this is "
+            "what signs in for you.  Skipped when Chrome or Edge can be "
+            "driven directly.",
+            "python -m playwright install chromium",
+            _probe_browser, ensure_browser),
+        SetupComponent(
+            "tesseract", "Tesseract OCR program", True,
+            "The OCR engine that reads the Gujarati headers.  Installed onto "
+            "this drive, no administrator rights needed.",
+            "winget install UB-Mannheim.TesseractOCR   (or "
+            "https://github.com/UB-Mannheim/tesseract/wiki)",
+            _probe_tesseract, ensure_tesseract),
+        SetupComponent(
+            "traineddata", "Gujarati language data", True,
+            "guj.traineddata (~2 MB) - without it Tesseract cannot read "
+            "જાહેર નોટિસ.  Stored in the app's own tessdata folder.",
+            f"download {GUJ_TRAINEDDATA_URL} into {local_tessdata_dir()}",
+            _probe_traineddata, ensure_gujarati_traineddata),
+        SetupComponent(
+            "winocr", "Windows Gujarati OCR pack", False,
+            "Optional.  Teaches the built-in Windows OCR Gujarati, which is "
+            "faster than Tesseract.  This is the only piece that needs "
+            "administrator rights - the app asks Windows for them (UAC).",
+            "ADMIN PowerShell:  DISM /Online /Add-Capability "
+            f"/CapabilityName:{WINDOWS_GUJ_OCR_CAPABILITY}     (or Settings "
+            "> Time & Language > Language & Region > Add ગુજરાતી > Language "
+            "options > install the optional OCR component)",
+            _probe_windows_guj, install_windows_gujarati_ocr),
+        SetupComponent(
+            "easyocr", "EasyOCR (not recommended)", False,
+            "Optional last-resort backend.  It downloads ~2 GB of torch and "
+            "still has no Gujarati model, so it cannot improve detection "
+            "here - listed only so the choice is visible.",
+            "pip install easyocr",
+            _probe_easyocr, _install_easyocr),
+    ]
 
 
 def restart_application() -> None:
@@ -2420,13 +2610,9 @@ def validate_ocr_setup() -> Tuple[List[str], List[str]]:
                 status.append(f"Windows OCR : installed, NO Gujarati "
                               f"[{langs}]")
                 fixes.append(
-                    "Windows OCR: add the Gujarati OCR pack.  Fastest way, in "
-                    "an ADMIN PowerShell:  "
-                    "DISM /Online /Add-Capability "
-                    "/CapabilityName:Language.OCR~~~gu-IN~0.0.1.0     "
-                    "(or Settings > Time & Language > Language & Region > "
-                    "Add a language > ગુજરાતી, then Language options > "
-                    "install the optional OCR component)")
+                    "Windows OCR: add the Gujarati OCR pack - Downloads > "
+                    "Downloads & Setup... > Install (it asks for admin "
+                    "once).  Optional: Tesseract already reads Gujarati.")
         except Exception as exc:
             status.append(f"Windows OCR : probe failed ({exc})")
 
@@ -2522,8 +2708,11 @@ def _build_ocr_engine(log) -> Optional[BaseOcrEngine]:
         if engine.supports_gujarati:
             log(f"[OCR] Using {engine.name} (Gujarati)", "success")
             return engine
+        # Normal, not a problem: the next rung usually reads Gujarati.  It
+        # only matters if EVERY rung comes up Latin-only, which is reported
+        # once, at the end, by the caller.
         log(f"[OCR] {label} available but WITHOUT Gujarati -> "
-            "trying next backend", "warn")
+            "trying next backend", "dim")
         latin_only = latin_only or engine
 
     if latin_only is not None and not require_guj:
@@ -2554,20 +2743,26 @@ def select_ocr_engine(reporter: ProgressReporter) -> Optional[BaseOcrEngine]:
                 pass
 
         # The full validator runs once per process, not once per edition.
-        if not _ocr_setup_logged.is_set():
-            _ocr_setup_logged.set()
-            status, fixes = validate_ocr_setup()
-            log("[OCR] Backend check:", "info")
-            for line in status:
-                log(f"        {line}", "dim")
-            for line in fixes:
-                log(f"[Setup] {line}", "warn")
+        first_time = not _ocr_setup_logged.is_set()
+        _ocr_setup_logged.set()
+        status, fixes = validate_ocr_setup() if first_time else ([], [])
+        for line in status:
+            log(f"[OCR] {line}", "dim")
 
         engine = _build_ocr_engine(log)
-        if engine is None:
+        if engine is not None and engine.supports_gujarati:
+            # Something reads Gujarati, so the other backends' setup notes are
+            # housekeeping, not a problem: one quiet pointer, no wall of DISM
+            # instructions on every run.
+            if fixes:
+                log(f"[OCR] {len(fixes)} optional extra(s) not installed - "
+                    "Downloads > Downloads & Setup... lists them.", "dim")
+        else:
+            for line in fixes:
+                log(f"[Setup] {line}", "warn")
             log("[OCR] No Gujarati-capable backend -> detection is "
-                "TEMPLATE-ONLY (weaker).  See the [Setup] lines above.",
-                "error")
+                "TEMPLATE-ONLY (weaker).  Open Downloads > Downloads & "
+                "Setup... and install Tesseract + Gujarati data.", "error")
         _ocr_engine_cache.append(engine)
         return engine
 
@@ -2772,14 +2967,16 @@ class HeaderTemplateVerifier:
                 variants.extend(HEADER_VARIANTS_NO_RAQM)
             if not _raqm_warned.is_set():        # once per process, not per agent
                 _raqm_warned.set()
+                # Dim, not a warning: nothing here can fix it (Pillow's
+                # Windows wheels have never bundled libraqm and there is no
+                # 'pillow[raqm]' extra), and it changes no result - the
+                # embedded templates were shaped at build time and OCR is
+                # what decides a match.  A warning every run for something
+                # that is neither actionable nor harmful is just noise.
                 self._reporter.log(
-                    "[Warning] RAQM not available -> fallback rendering "
-                    "(embedded templates are unaffected; OCR decides "
-                    "matches).", "warn")
-                self._reporter.log(
-                    "          Pillow's Windows wheels do not bundle "
-                    "libraqm and there is no 'pillow[raqm]' extra, so "
-                    "pip cannot fix this - see setup_ocr.py --raqm.", "dim")
+                    "[OCR] RAQM not available -> fallback text rendering "
+                    "(embedded templates unaffected; see setup_ocr.py "
+                    "--raqm).", "dim")
 
         for text, script in variants:
             fonts = guj_fonts if script == "guj" else eng_fonts
@@ -4383,6 +4580,10 @@ class GalleryPanel(ttk.LabelFrame):
         self._deselected: set = set()
         self._columns = 2
         self._laying_out = False
+        #: pending coalesced work (see _layout / _request_nav)
+        self._layout_job: Optional[str] = None
+        self._nav_job: Optional[str] = None
+        self._last_width = 0
         self.on_show_more: Optional[Callable[[], None]] = None   # legacy
         self.on_page_change: Optional[Callable[[], None]] = None
 
@@ -4471,7 +4672,7 @@ class GalleryPanel(ttk.LabelFrame):
         # No auto-jump on creation: the driver registers every edition's
         # heading up front, and jumping to each in turn would leave the user
         # staring at the last paper before a single notice exists.
-        self._update_nav()
+        self._request_nav()
         return len(self.sections) - 1
 
     def add_result(self, result: NoticeResult) -> None:
@@ -4490,7 +4691,7 @@ class GalleryPanel(ttk.LabelFrame):
                                len(section["results"]) - 1)  # type: ignore
         if target == self._page_index:
             self._append_card(result)          # cheap: no full redraw
-            self._update_nav()
+            self._request_nav()
         elif self.follow_live and len(self.results) == 1:
             # Jump once, to the very first notice of the run, so something
             # visibly lands.  After that the view stays put: agents publish
@@ -4498,7 +4699,7 @@ class GalleryPanel(ttk.LabelFrame):
             # between newspapers while the user is trying to read one.
             self.goto_page(target, user=False)
         else:
-            self._update_nav()
+            self._request_nav()
 
     # -- search ---------------------------------------------------------------
     def build_search_bar(self, parent) -> ttk.Frame:
@@ -4756,7 +4957,22 @@ class GalleryPanel(ttk.LabelFrame):
             self.configure(text="Detected Public Notices")
 
     def _layout(self) -> None:
+        """Ask for a masonry pass; several requests collapse into one.
+
+        Every pass forces a full geometry update, and the old code ran one
+        per notice added and one per pixel of window resize - 60 notices
+        meant 60 passes over 60 cards, which is what made the window crawl
+        once the results were in.  Coalescing makes that a single pass."""
+        if self._layout_job is not None:
+            return
+        try:
+            self._layout_job = self.after_idle(self._layout_now)
+        except tk.TclError:                  # window closing
+            self._layout_job = None
+
+    def _layout_now(self) -> None:
         """Masonry: each card drops into the currently shortest column."""
+        self._layout_job = None
         if self._laying_out:
             return
         self._laying_out = True
@@ -4784,12 +5000,36 @@ class GalleryPanel(ttk.LabelFrame):
             total_h = max(heights) + gap
             self._canvas.itemconfigure(self._window, height=total_h)
             self._canvas.configure(scrollregion=(0, 0, avail, total_h))
+        except tk.TclError:
+            pass                              # widgets went away mid-pass
         finally:
             self._laying_out = False
 
     def _on_canvas_resize(self, event) -> None:
+        # Height-only changes (a scrollbar appearing, the log pane opening)
+        # cannot move a card, so they must not trigger a relayout.
+        if event.width == self._last_width:
+            return
+        self._last_width = event.width
         self._canvas.itemconfigure(self._window, width=event.width)
         self._layout()
+
+    def _request_nav(self) -> None:
+        """Coalesced _update_nav: it rebuilds the whole page list, and the
+        arrival of one notice does not need that done immediately."""
+        if self._nav_job is not None:
+            return
+        try:
+            self._nav_job = self.after_idle(self._nav_now)
+        except tk.TclError:
+            self._nav_job = None
+
+    def _nav_now(self) -> None:
+        self._nav_job = None
+        try:
+            self._update_nav()
+        except tk.TclError:
+            pass
 
     def _on_mousewheel(self, event) -> None:
         delta = -1 if getattr(event, "delta", 0) > 0 or \
@@ -5038,6 +5278,14 @@ class Application(ttk.Frame):
         style.configure("Date.TButton", anchor="w", padding=(6, 2))
         # A search hit reads like a text selection: blue surround on the card.
         style.configure("Match.TFrame", background="#2563eb")
+        # Notice-type segmented buttons: Gujarati-capable, and the selected
+        # one is filled in so the click is unmistakable.
+        style.configure("NoticeType.Toolbutton", font=(self._guj_ui_font, 10),
+                        padding=(10, 3), anchor="center")
+        style.map("NoticeType.Toolbutton",
+                  background=[("selected", "#20486e"), ("active", "#cfe0f5")],
+                  foreground=[("selected", "#ffffff")],
+                  relief=[("selected", "sunken"), ("pressed", "sunken")])
 
     # -- menu -----------------------------------------------------------------
     def _build_menu(self) -> None:
@@ -5059,14 +5307,160 @@ class Application(ttk.Frame):
         tools_menu.add_separator()
         tools_menu.add_command(label="Network (Proxy)...",
                                command=self._open_proxy_dialog)
-        tools_menu.add_command(label="Download Dependencies...",
-                               command=self.download_dependencies)
         menubar.add_cascade(label="Tools", menu=tools_menu)
+
+        downloads_menu = tk.Menu(menubar, tearoff=0)
+        downloads_menu.add_command(label="Downloads && Setup...",
+                                   command=self._open_downloads_dialog)
+        downloads_menu.add_separator()
+        downloads_menu.add_command(label="Install everything missing",
+                                   command=self.download_dependencies)
+        menubar.add_cascade(label="Downloads", menu=downloads_menu)
 
         help_menu = tk.Menu(menubar, tearoff=0)
         help_menu.add_command(label="About...", command=self._show_about)
         menubar.add_cascade(label="Help", menu=help_menu)
         self.root.config(menu=menubar)
+
+    def _open_downloads_dialog(self) -> None:
+        """One window listing every installable piece: what it is, whether it
+        is here, how to get it, and a button that gets it.
+
+        The old 'Download Dependencies' button installed everything blind and
+        said nothing about what was missing or why - this shows the whole
+        stack, including the pieces that button never covered (the Windows
+        Gujarati OCR pack, EasyOCR)."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Downloads & Setup")
+        dialog.geometry("860x640")
+        dialog.transient(self.root)
+        outer = ttk.Frame(dialog, padding=10)
+        outer.pack(fill="both", expand=True)
+
+        ttk.Label(outer, font=("Segoe UI", 11, "bold"),
+                  text="Everything this app can install").pack(anchor="w")
+        ttk.Label(outer, foreground="#555555", wraplength=820, justify="left",
+                  text="Required pieces are needed for a normal run.  "
+                       "Optional ones are alternatives - the app works "
+                       "without them.  Installs run in the background and "
+                       "report below.").pack(anchor="w", pady=(2, 8))
+
+        rows = ttk.Frame(outer)
+        rows.pack(fill="x")
+        rows.columnconfigure(1, weight=1)
+
+        log_box = scrolledtext.ScrolledText(outer, height=9, wrap="word",
+                                            font=("Consolas", 9),
+                                            state="disabled")
+        log_box.pack(fill="both", expand=True, pady=(10, 6))
+
+        def write(text: str) -> None:
+            def append() -> None:
+                log_box.configure(state="normal")
+                log_box.insert("end", text.rstrip() + "\n")
+                log_box.configure(state="disabled")
+                log_box.yview_moveto(1.0)
+            self.root.after(0, append)
+
+        components = setup_components()
+        widgets: Dict[str, tuple] = {}
+        busy = {"running": False}
+
+        def refresh() -> None:
+            for component in components:
+                try:
+                    ready, detail = component.probe()
+                except Exception as exc:                  # a probe must never
+                    ready, detail = False, f"check failed ({exc})"  # kill the
+                mark, colour = (("READY", "#0a6b0a") if ready else
+                                (("MISSING", "#c00000") if component.required
+                                 else ("optional", "#a86500")))
+                status_lbl, button = widgets[component.key]
+                status_lbl.configure(text=f"{mark}  -  {detail}",
+                                     foreground=colour)
+                button.configure(
+                    text="Reinstall" if ready else "Install",
+                    state=("disabled" if busy["running"]
+                           or component.install is None else "normal"))
+
+        def run_install(chosen: List[SetupComponent]) -> None:
+            if busy["running"]:
+                return
+            busy["running"] = True
+            refresh()
+
+            def work() -> None:
+                for component in chosen:
+                    if component.install is None:
+                        continue
+                    write(f"\n=== {component.name} ===")
+                    try:
+                        ok = component.install(write)
+                    except Exception as exc:
+                        ok = False
+                        write(f"  failed: {exc}")
+                    write(f"  -> {'done' if ok else 'not completed'}")
+                reset_ocr_engine_cache()
+                write("\nRe-checking...")
+
+                def finish() -> None:
+                    busy["running"] = False
+                    refresh()
+                    for line in validate_ocr_setup()[0]:
+                        write("  " + line)
+                self.root.after(0, finish)
+
+            threading.Thread(target=work, daemon=True,
+                             name="downloads").start()
+
+        for row, component in enumerate(components):
+            tag = "required" if component.required else "optional"
+            name = ttk.Label(rows, text=f"{component.name}  ({tag})",
+                             font=("Segoe UI", 10, "bold"))
+            name.grid(row=row * 3, column=0, columnspan=2, sticky="w",
+                      pady=(8, 0))
+            status_lbl = ttk.Label(rows, text="checking...")
+            status_lbl.grid(row=row * 3 + 1, column=0, columnspan=2,
+                            sticky="w")
+            ttk.Label(rows, text=component.detail + "\nManual: "
+                      + component.instructions,
+                      foreground="#555555", wraplength=640,
+                      justify="left").grid(row=row * 3 + 2, column=0,
+                                           sticky="w", pady=(0, 2))
+            button = ttk.Button(
+                rows, text="Install", width=12,
+                command=lambda c=component: run_install([c]))
+            button.grid(row=row * 3 + 1, column=1, rowspan=2, sticky="e",
+                        padx=(10, 0))
+            widgets[component.key] = (status_lbl, button)
+
+        buttons = ttk.Frame(outer)
+        buttons.pack(fill="x")
+
+        def install_missing() -> None:
+            missing = []
+            for component in components:
+                if component.install is None or component.key == "easyocr":
+                    continue          # never pull 2 GB of torch unasked
+                try:
+                    if not component.probe()[0]:
+                        missing.append(component)
+                except Exception:
+                    missing.append(component)
+            if not missing:
+                write("Nothing to install - everything required is here.")
+                return
+            write("Installing: " + ", ".join(c.name for c in missing))
+            run_install(missing)
+
+        ttk.Button(buttons, text="Install everything missing", width=24,
+                   command=install_missing).pack(side="left")
+        ttk.Button(buttons, text="Re-check", width=12,
+                   command=refresh).pack(side="left", padx=(6, 0))
+        ttk.Button(buttons, text="Close", width=10,
+                   command=dialog.destroy).pack(side="right")
+        refresh()
+        dialog.bind("<Escape>", lambda _e: dialog.destroy())
 
     def _open_db_autologin_dialog(self) -> None:
         """Enable one-time automatic login: the app reads the CURRENT cookie
@@ -5464,16 +5858,22 @@ class Application(ttk.Frame):
         # the URL's own - wide - column; deps button keeps cols 4-5).
         self.gallery.build_search_bar(controls).grid(
             row=1, column=3, sticky="ew", padx=(16, 0), pady=(0, 6))
-        # Which notice type this run extracts.
+        # Which notice type this run extracts.  Segmented buttons, not a
+        # dropdown: the chosen one stays visibly pressed, so the click has an
+        # effect you can see and the current choice is readable at a glance.
         type_frame = ttk.Frame(controls)
         ttk.Label(type_frame, text="Notice type:").pack(side="left")
         self.notice_type_var = tk.StringVar(value=NOTICE_TYPE_CHOICES[0])
-        type_combo = ttk.Combobox(type_frame,
-                                  textvariable=self.notice_type_var,
-                                  state="readonly", width=16,
-                                  values=list(NOTICE_TYPE_CHOICES),
-                                  font=(self._guj_ui_font, 10))
-        type_combo.pack(side="left", padx=(4, 0))
+        self._type_buttons = []
+        for choice in NOTICE_TYPE_CHOICES:
+            button = ttk.Radiobutton(
+                type_frame, text=choice, value=choice,
+                variable=self.notice_type_var, style="NoticeType.Toolbutton",
+                command=lambda c=choice: self._on_notice_type(c))
+            button.pack(side="left", padx=(4, 0))
+            self._type_buttons.append(button)
+        self._type_hint = ttk.Label(type_frame, text="", foreground="#0a6b0a")
+        self._type_hint.pack(side="left", padx=(10, 0))
         type_frame.grid(row=2, column=0, columnspan=3, sticky="w",
                         padx=(8, 0), pady=(0, 6))
 
@@ -5504,6 +5904,19 @@ class Application(ttk.Frame):
         self._refresh_url()
 
     # -- date picker & URL auto-fill -----------------------------------------
+    def _on_notice_type(self, choice: str) -> None:
+        """Apply the notice-type choice immediately and confirm it on screen.
+
+        It used to be a dropdown whose value only took effect when Extract
+        started, so a click looked like nothing happened."""
+        set_notice_type(choice)
+        label = "all notice types" if choice == NOTICE_TYPE_CHOICES[0] \
+            else f"“{choice}” only"
+        self._type_hint.configure(text=f"✓ extracting {label}")
+        self.status_bar.configure(text=f"Notice type: {label}")
+        # The tick is confirmation of a click, not a permanent label.
+        self.after(2500, lambda: self._type_hint.configure(text=""))
+
     def _is_all_mode(self) -> bool:
         return self.newspaper_var.get() == ALL_NEWSPAPERS_LABEL
 
@@ -6059,7 +6472,9 @@ class Application(ttk.Frame):
         self.status_bar.configure(text=text)
 
     def _update_count(self) -> None:
-        count = len(self.gallery.all_results())
+        # len(self.gallery.results), not all_results(): the latter copies the
+        # whole list, and this runs once per notice as they stream in.
+        count = len(self.gallery.results)
         text = f"{count} notice{'s' if count != 1 else ''}"
         label = self.gallery.page_label()
         if label:
@@ -6109,6 +6524,16 @@ class Application(ttk.Frame):
             parent=self.root, title=f"Choose a folder to save {label} notices")
         if not directory:
             return
+        # data/ is wiped when the app closes - saving into it would quietly
+        # throw the notices away at the end of the session.
+        if config.is_inside_data(directory):
+            messagebox.showwarning(
+                APP_NAME,
+                "That folder is inside the app's own data folder, which is "
+                "cleared when the app closes.\n\nPick a folder outside "
+                "notice_extractor/data - your Documents, for example.",
+                parent=self.root)
+            return
 
         existing = [r for r in results if os.path.exists(
             os.path.join(directory, r.suggested_filename))]
@@ -6145,6 +6570,16 @@ class Application(ttk.Frame):
                 return
             self._cancel_event.set()
         shutdown_ocr_pool()
+        # Nothing a run produced stays on this machine: the crops were only
+        # ever in memory unless Save wrote them somewhere you chose, and the
+        # diagnostics the app wrote for itself go now.  The stored login is
+        # deliberately kept (see config.PERSISTENT_NAMES).
+        if config.CLEAR_DATA_ON_EXIT:
+            run_logger.close()
+            config.clear_run_data()
+            # __pycache__ folders a test run or a tool left in the tree; the
+            # launcher keeps normal runs from making them at all.
+            config.clear_pycache()
         self.root.destroy()
 
 

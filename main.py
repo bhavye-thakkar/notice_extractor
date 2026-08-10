@@ -27,6 +27,17 @@ _ROOT = os.path.dirname(_HERE)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
+# Bytecode caches go to the machine cache, not the source tree.  Spelled out
+# rather than read from config.py because importing config is itself an
+# import, and the prefix has to be set before one happens (same reason the
+# launcher repeats it).  Reaching here via `python -m` still leaves one
+# __pycache__ for this module; closing the app sweeps it.
+sys.pycache_prefix = os.path.join(
+    os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
+    "PublicNoticeExtractor", "pycache") if sys.platform.startswith("win") \
+    else os.path.join(os.path.expanduser("~"), ".cache",
+                      "public-notice-extractor", "pycache")
+
 from notice_extractor import config                       # noqa: E402
 from notice_extractor.utils import logger as run_logger   # noqa: E402
 
@@ -137,6 +148,10 @@ def _headless(args) -> int:
     print(f"\n{len(results)} notice(s) found.")
     if args.save and results:
         folder = os.path.abspath(args.save)
+        if config.is_inside_data(folder):
+            print("  warning: that folder is inside notice_extractor/data, "
+                  "which the app clears when it closes - saving elsewhere is "
+                  "safer.")
         os.makedirs(folder, exist_ok=True)
         for result in results:
             core.save_image_unicode(
