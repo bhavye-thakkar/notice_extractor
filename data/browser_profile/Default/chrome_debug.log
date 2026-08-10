@@ -1,0 +1,10 @@
+[0810/163002.267:ERROR:net\disk_cache\cache_util_win.cc:25] Unable to move the cache: Access is denied. (0x5)
+[0810/163002.267:ERROR:net\disk_cache\cache_util_win.cc:25] Unable to move the cache: Access is denied. (0x5)
+[0810/163002.267:ERROR:net\disk_cache\disk_cache.cc:284] Unable to create cache
+[0810/163002.267:ERROR:gpu\ipc\host\gpu_disk_cache.cc:737] Gpu Cache Creation failed: -2
+[0810/163002.267:ERROR:net\disk_cache\disk_cache.cc:284] Unable to create cache
+[0810/163002.267:ERROR:gpu\ipc\host\gpu_disk_cache.cc:737] Gpu Cache Creation failed: -2
+[0810/163002.267:ERROR:net\disk_cache\cache_util_win.cc:25] Unable to move the cache: Access is denied. (0x5)
+[0810/163002.268:ERROR:net\disk_cache\disk_cache.cc:284] Unable to create cache
+[0810/163002.268:ERROR:gpu\ipc\host\gpu_disk_cache.cc:737] Gpu Cache Creation failed: -2
+[0810/163004.276:WARNING:components\leveldb_proto\internal\leveldb_database.cc:102] Unable to open E:\unispace\jaher notice\notice_extractor\data\browser_profile\Default\shared_proto_db\metadata: IO error: E:\unispace\jaher notice\notice_extractor\data\browser_profile\Default\shared_proto_db\metadata/LOCK: Access denied. (ChromeMethodBFE: 15::LockFile::5)
