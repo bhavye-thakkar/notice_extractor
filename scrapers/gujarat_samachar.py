@@ -166,7 +166,9 @@ class GujaratSamacharPipeline(NoticeDetectionPipeline):
     thresholds (true notices score 0.90+; page furniture stays below)."""
     newspaper_name = "Gujarat Samachar"
     default_config = GS_DETECTION_CONFIG
-    embedded_prefixes = ("gs-",)
+    # "chetavni-" is the real જાહેર ચેતવણી crop: every paper needs it,
+    # because it is the only real-typeface template that type has.
+    embedded_prefixes = ("gs-", "chetavni-")
 
 
 class GujaratSamacharExtractor(BaseNewspaperExtractor):

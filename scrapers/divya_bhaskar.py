@@ -1407,7 +1407,7 @@ class DivyaBhaskarPipeline(NoticeDetectionPipeline):
     Gujarat Samachar crops as backup."""
     newspaper_name = "Divya Bhaskar"
     default_config = DB_DETECTION_CONFIG
-    embedded_prefixes = ("db-", "sandesh-", "gs-")
+    embedded_prefixes = ("db-", "sandesh-", "gs-", "chetavni-")
 
 
 class DivyaBhaskarExtractor(BaseNewspaperExtractor):

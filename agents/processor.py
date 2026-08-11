@@ -63,10 +63,29 @@ def run_jobs(jobs: Sequence[Job], reporter: "core.ProgressReporter", *,
     summary = RunSummary()
     started = time.perf_counter()
     workers = core.resolve_job_workers(len(jobs))
+    # Tells each edition how much of the global page budget is its own - see
+    # core.page_workers().  One paper gets the machine; eight share it.
+    core.ACTIVE_AGENTS[0] = max(1, len([j for j in jobs if j[3]]))
     try:
         core.cv2.setNumThreads(core.CV2_THREADS_PER_DETECT)
     except Exception:
         pass
+
+    #: What each agent has published so far, by section title.  An agent that
+    #: times out has already streamed its notices into the gallery, so the
+    #: final summary has to count them - reporting "3 notices" under a screen
+    #: showing 57 is worse than being slow.
+    live: Dict[str, "core.BufferedJobReporter"] = {}
+
+    def _salvage(title: str, cls) -> int:
+        """Notices an agent published before it failed or was abandoned."""
+        buffered = live.get(title)
+        found = len(buffered.collected) if buffered is not None else 0
+        if found:
+            summary.total += found
+            summary.per_paper[cls.display_name] = \
+                summary.per_paper.get(cls.display_name, 0) + found
+        return found
 
     def _run_one(job: Job, section_title: str):
         """One edition agent: download + detect, isolated from every other
@@ -79,6 +98,7 @@ def run_jobs(jobs: Sequence[Job], reporter: "core.ProgressReporter", *,
         for attempt in range(1, core.AGENT_RETRIES + 2):
             reporter.check_cancel()
             buffered = core.BufferedJobReporter(reporter, label, section_title)
+            live[section_title] = buffered
             extractor = cls(broad=broad)
             extractor.current_issue_date = day.isoformat()
             try:
@@ -153,10 +173,13 @@ def run_jobs(jobs: Sequence[Job], reporter: "core.ProgressReporter", *,
                         for future in pending:
                             _job, title = futures[future]
                             future.cancel()
+                            kept = _salvage(title, _job[0])
+                            tail = (f" - keeping the {kept} notice(s) it had "
+                                    "already found") if kept else ""
                             reporter.log(
                                 f"[Agent] {title} -> TIMEOUT after "
-                                f"{core.AGENT_TIMEOUT_SECONDS}s, abandoned",
-                                "error")
+                                f"{core.AGENT_TIMEOUT_SECONDS}s, abandoned"
+                                f"{tail}", "error")
                             summary.skipped.append(title)
                         break
                     continue
@@ -172,12 +195,15 @@ def run_jobs(jobs: Sequence[Job], reporter: "core.ProgressReporter", *,
                     except core.ExtractionCancelled:
                         raise
                     except core.ExtractionError as exc:
-                        reporter.log(f"[Agent] {title} -> failed: {exc}",
-                                     "error")
+                        kept = _salvage(title, cls)
+                        reporter.log(f"[Agent] {title} -> failed: {exc}"
+                                     + (f" (kept {kept} notice(s))"
+                                        if kept else ""), "error")
                         summary.skipped.append(title)
                         reporter.progress(done, len(runnable))
                         continue
                     except Exception:
+                        _salvage(title, cls)
                         reporter.log("Unexpected error:\n"
                                      + traceback.format_exc(), "error")
                         summary.skipped.append(title)
@@ -212,6 +238,7 @@ def run_jobs(jobs: Sequence[Job], reporter: "core.ProgressReporter", *,
         reporter.failed("An unexpected error occurred - see the log.")
     finally:
         summary.seconds = summary.seconds or (time.perf_counter() - started)
+        core.ACTIVE_AGENTS[0] = 1
         try:
             core.cv2.setNumThreads(-1)      # restore OpenCV's default
         except Exception:

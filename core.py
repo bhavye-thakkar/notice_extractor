@@ -75,6 +75,7 @@ import sys
 import glob
 import json
 import time
+import collections
 import base64
 import contextlib
 import functools
@@ -375,8 +376,13 @@ SWEEP_WORD_PAIRS: Tuple[Tuple[str, str], ...] = (
     ("જાહેર", "નોટ"),
     ("જાહેર", "ચેત"),          # જાહેર ચેતવણી (public warning)
 )
-# Single OCR "words" that already contain the whole title.
-SWEEP_SINGLE_WORDS: Tuple[str, ...] = ("જાહેરનોટ",)
+# Single OCR "words" that already contain the whole title (the printed form
+# runs the two words together, or OCR joins them), tagged with the notice
+# type they belong to so the run's toggle can filter them.
+SWEEP_SINGLE_WORDS: Tuple[Tuple[str, str], ...] = (
+    ("જાહેરનોટ", "notice"),
+    ("જાહેરચેત", "chetavni"),
+)
 # FUZZY_MATCH_RATIO (tolerance for OCR errors in keywords) is defined with the
 # matcher itself, in utils/search.py, and imported at the top of this file.
 OCR_STRIP_TARGET_HEIGHT = 72      # strips are upscaled to this before OCR
@@ -387,7 +393,18 @@ OCR_MAX_STRIPS_PER_PAGE = 90      # safety cap
 OCR_WORKERS = 4
 # The full-page OCR sweep reads a page downscaled to this width.  Titles are
 # display-size type and still read fine; Tesseract cost scales with pixels.
-SWEEP_MAX_WIDTH = 1100
+# Measured on a real page, Gujarati-only: 1100 px = 17.6 s, 900 = 9.0 s,
+# 750 = 4.6 s.  900 is the knee - below it the title glyphs start to break up.
+SWEEP_MAX_WIDTH = 900
+# The full-page OCR sweep only runs when the template scan saw SOMETHING
+# header-shaped on the page (its best score anywhere).  Set to 0.0 to sweep
+# every page with no detections, as before - slower, and on the edition this
+# was measured against it changed nothing.
+OCR_SWEEP_MIN_TEMPLATE = 0.60
+# Templates the full-page scan sweeps with.  Each one costs a matchTemplate
+# over the whole page at every scale, so the budget is small and is shared
+# between the notice types a run is looking for - see _select_scan_templates.
+PAGE_SCAN_TEMPLATES = 6
 
 # Networking ------------------------------------------------------------------
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -447,9 +464,36 @@ HTTP_RETRY_DELAY_SECONDS = 1.5
 # The CPU-bound part (template matching) is governed separately by
 # DETECT_CONCURRENCY below, so adding agents never turns into CPU thrash.
 MAX_PARALLEL_JOBS = 16        # ceiling on simultaneous edition agents
-# Pages fetched ahead of the detector inside one job (bounded so a 40-page
-# edition never holds 40 decoded pages in memory at once).
-PAGE_PREFETCH = 3
+# Pages of one edition processed at the same time.  This is both the
+# parallelism inside a single-newspaper run AND the cap on decoded pages held
+# in memory (~22 MB each), so it is shared out from the GLOBAL detect budget
+# rather than fixed per edition: only DETECT_CONCURRENCY pages can compute at
+# once no matter how many agents there are, so eight editions each holding
+# three decoded pages just parks half a gigabyte waiting for a slot.
+#   1 edition  -> 3 pages at once (a single-paper run fills the machine)
+#   8 editions -> 1 page each     (the gate was going to serialise them)
+# 3, not 4: measured on one 18-page Sandesh edition, 3 pages took 157 s and 4
+# took 193 s.  Past three, the cv2 pools and the Tesseract subprocesses want
+# more threads than the box has and everything slows down together.
+PAGE_WORKERS_MAX = 3
+#: Editions running right now; set by the agent runner around a run.
+ACTIVE_AGENTS = [1]
+
+
+def page_workers() -> int:
+    """How many pages of ONE edition to have in flight."""
+    agents = max(1, ACTIVE_AGENTS[0])
+    return max(1, min(PAGE_WORKERS_MAX,
+                      -(-DETECT_CONCURRENCY // agents)))   # ceil div
+#: Decoded pages kept per downloader.  One: every agent has its own
+#: downloader, so this is multiplied by the number of editions running.
+IMAGE_CACHE_MAX = 1
+
+# --- GUI responsiveness ------------------------------------------------------
+#: How often the GUI drains the worker queue, and how many messages it
+#: handles per pass before giving Tk the event loop back.
+POLL_INTERVAL_MS = 80
+MSG_PER_TICK = 60
 
 #: Cap on pages per edition, for quick checks (main.py --pages N).  0 = all.
 PAGE_LIMIT = [0]
@@ -1152,6 +1196,124 @@ EMBEDDED_HEADER_TEMPLATES_B64: Tuple[Tuple[str, str], ...] = (
      "P966YlGna+Yu8hFSefnjsbBpYmb2uPYd2jPVt93x9tf9JixaErn8fq5cvOW2i6oXfVqfZQCxG+8u"
      "rm7t/Ma8oeM2r/Bu3rg43eWFc66OnN+c5zz7/l1DfmX/9ct94988NHH126l79rf9/P0L7/Nm+Zck"
      "ZhyZ+u1zAU4g0an0fwOWw2hATsYQwgAAAABJRU5ErkJggg=="),
+    # A real જાહેર ચેતવણી header, cropped from Sandesh page 14.
+    # Every other positive here is a જાહેર નોટિસ crop, which left the
+    # page sweep with nothing real to match ચેતવણી against.  White-on-
+    # black like the Divya Bhaskar pills; _match_one takes |score|, so
+    # the inversion matches dark-on-light headers too.
+    ("chetavni-sandesh-1",
+     "iVBORw0KGgoAAAANSUhEUgAAALcAAAAwCAAAAAB2sLQjAAAYqUlEQVRoBY3Bd5hV5dU34N9az7P3"
+     "PnVgZmBmGLCBJho1GgsaW2wxmmhQo1fsiBoLZRApdrBgQSQGUWOs0cQSowwxIohdo7HGrthiRdoM"
+     "M3POnHP22ft51nrHQN4//D4v3/smwXerIUsA1CsbANXQ4FsQoN4bsCgxAyoGGyi+gbCB4hsI60mc"
+     "JahTw17Y4msKgACQ4rspNGXDqiRqKzkQvo2oklFCEoDgPbFaQBUAEf7PBATCAIWAAQIUAiIMIHyN"
+     "bsN30WrWpi4ITb8bWqkNXZkr1h2+RaCJySU1mwZkjUs4gIMOAJjwfyZKIAJAqecAaWyLlFSoEKQO"
+     "TPgafR/fiTwZFoGnXFpv6DNWFd9KyIgnghqjDkSkUCgAwjcoNiD8/yhBoSBAFYa9gyUVMEGVQITv"
+     "QoF4sCgRKOSUMyXBtyKjEoYVeCZVRZArK76FYgPCt1EQoIQBnONqar0yIADRYHwnQpJ6AQEIi3GU"
+     "72KDb0Wa5M2abI1FmZzNOSImKMD4BsUGhG8QbCBE6r0TJsc5GyMDMERATG34LmR7aVSrq6ih0nvZ"
+     "kDNVZnwL8jBxmPTslkW/L9KKL5I8G0uA4v9B2EDxDQoCASBPPvaaG1Tk/t5emExoiFW8GqahWI8A"
+     "KACCAoQBCgJBlaIvwsn7clktffaH9wqBNR6AglSsKkBQ/BcL2UQq9Vk7mz7fwG8sfC0yQcCqUCUo"
+     "GKIgIigAUgURFF9TfI0YImDCf5DWtbz5RiNHNnLl07c/XpHR0LJ6pQFt+C+CKogUAwiAKg1Qr6Yr"
+     "vXZMc2iAlX+chSYNhEk9G0lDFSUGFFAABDC8kZ76HT9tCgj48vYrfd4E7L0hMXAI4AWGFAO8UQ/L"
+     "IowBCkDAAVIHC1UFCFRCfupeGzeRt/3LF/++5nMZowomoTasJ44NEVTxXwoBMaka1zVxdPsWQy3V"
+     "Pzryi3zAHlAQQVNmAkBQKABCHVZDXuPO/f6oLRoZ7qWxnw5PlJByoIAqMYRIHBnyIAKReqUB+Jo4"
+     "WFYheIG1JMLSffiVm0r/l2satww/mv5UGmQMwWvgqA3/iwgiSgRAATBEwUS+e5PPtiqFJxyzCVPf"
+     "kpPjtmrEoiQKk1jLIiACFACBVFliSGup0HHEMJGuP8yrjQD5fhOJgsRzUEcAsJGUPJggSgwmqKpB"
+     "ImwIBFEQqSR9aJn7y4b64htf3nLebvzCuI+4aNmkaTahVqzHVkRVoUxQKKCGCSog7R25sg/UOO70"
+     "zcitm/XHejsnntg7EzpmqCiYoAAIKmDn88HngtYpY9vE986bE3Jjru7ZezI+MZGBAuK8ZuvesKox"
+     "CkBFJLLOK8hwjayBEssad970AuOCOSa3411tbmnHpw2BCZN6IaFWrKcCsCFVkAIKhQ9C8qknE4af"
+     "tmZWVRpPmNYauDemP19vDMBGxYSJFxBBQVAAhDjKVG1xZbV18Nqe3MSJzRZdxzzJuRDGiCfjEw7D"
+     "JOYAzuTiVKxRNeQAVVExhiECa5QAFVXXq4v3VbP20ttNPHLR1rT84kdqYRSmac5TK9ZTgTEGzhED"
+     "UABqLNR5QLJVmGqMIUfOyhqzdOLqbMAG3pMlJ2oMqwAKgCCRrdiw3N+oPda3njK5QZLFJ1dtaJmh"
+     "YHVESCTKUiphBWwNvCo2cBqwgAxZlyizJPVY3x5lzb8vu1PQftkJCT9xzluZbCBCllqwHkHUMHkP"
+     "BkAArHfKhlQJUqy4Yrl328nHg0unPVyPQlYR1UgVzAQFFABBvSBIh9RLzWvVu52mHC7UM+aVtLHg"
+     "UlYok3eRUSJJ4qRIpMQQGFWAmFJhgIw655WDgJGuxfubGXx26Z2h5CdcLPzcWS/nc8RUy1ELNpA0"
+     "0SAwrAqAAGRq/S7IhipRuVihQlxKMjuceTCbJRe+o1FAzOrBTKJKxFAABNaEokpDV5QvR7X+wp6T"
+     "969H987+CIMCIahYm9YyoaslNoO4AFeXwBJYVEDEquJhbFoLIoskRWhW2ad3jNLPrryTpKVjSojl"
+     "Zzybz4m1PYOpjVNOA/IoeYlSjowxgkBdkFDFe1gDsWhMNK2khOwOJ57oezt/+1lea6RQUgNBJkht"
+     "oPWIq9lMXCUfR/0ROQvnmg+avG3YdfOCVblMwHVkOUYScbUiJiz0mihAShElBNaS9crQKCiRuCxI"
+     "vYOxsR7ZFvnel95VtJw5zeiqMx9GTtgkIbVyGqWMepIM2vIH/qVPXGSMIUhYrnF7U1AvlbqjpkpY"
+     "rYQjN21sKDdfEbg3Fzxe8lLMhetMJrPKC0JjEDrYekBxCt8SVONGqfp6jYYeMHUbfDBvcVcu64l9"
+     "akEsJTRlK4V+7opsEbEGmuTX+REuKaRr6xnb6IPePtM+Mv/pmwoMblBjXU8vN00+H7pu+qI0q0QE"
+     "aoHPa13qvP2eO25hXnx32UcIGWlke+L99t8kqq9+dSEKue7aXtv9YLOmQlfXvpn+Pzz+fl/cdtD3"
+     "zbogE63xq59fns+kWa6YIPYkutExjfVqU5wkn/3zfR5y6UmJeeGaJ6SB6uq1sTsquN6m/XbsN+kL"
+     "S3yhkPYjI0lxzVbHFn3+84f/NeRne6TR2/dvdMjo7KcvLX9CzfHtYdY/vZSaJ5+v6JnemeaUiEBt"
+     "qSvY/lhGTj20aL0kt970cWC4nIl6Gy8+olm5t7Mjzox839w4Jm98atTiy6NfyWUr2160nyOjpLTi"
+     "5j/0FUKF+Gzdw4X7/64VzsSGll93OxWnnR1n1l3+l65CtiYBNX1SzKflEWdMgE+m/9EU+xJ4ErLu"
+     "4PkjiF6Yt2jkeeOcffX0H5+6FUt5yYQ+Wrp7QH3zL+HmjgsUPdM7XRYgArWncdZW+gu/uHSzyjvd"
+     "3xtRvvXWFUVKqwEdPGm7ANT3t1N5UFzf7MafQCtfru7ONXef956PsPFRe5F62qYh4Jfm369NqRtU"
+     "y5JL42CvySDJbpU35fvmftR03qQAq87/e9nbZk1KbWube2IZesol7Gvj7290fdHQlmLquj/c+6Z2"
+     "omd+u2TjGad78+akTfYf0bpJuPzyh5Mnd7RaXjCLmjsuVPRO7XQ5gEhpaJiwr8TbTz1K1h747sx9"
+     "tva3Xt+VK5T6dr98hwyT614yIQnSYMzZ20K+uPe6lWabjT5bVctxnzQ6Z+I5Y1qZlkz7KBe5TF/B"
+     "58K+3nBojw2arti3oJ/ffGXTjNOK6JqymKlmy1Ecpk2VVJvGXRZo/1l316VtowOO2Djteeu4jR78"
+     "Punj854cMaGD8PbYd/KZvaaM1i8Pfeeh3fNJ/cazqaljpqJ3aqfL4Ws0qNFrray/mjus5+mjPIpz"
+     "jq7eMjd2aHlpeEnyEfoWnkLbrOzZ+/ydMubZc/5JxRJrPowTtrafTNI+Z/+moNR5uhvB5XJT2eWs"
+     "SD9THYedv7VgydjMJafBpWfd54pBsrZoA0es1HbU5BC6/QfJoCknbuzjig+3Hn7/po6XXfV024Tz"
+     "QG8f94bV7/3mxAb/uysW7pKhnvmXUFPHTKXeKZ0+hwFKjUUvrlw45VJb+dMZkU2Gzz76i5uutPTs"
+     "9uYBGr2x9iyaXBnqe2TbmQdHH113HQTI5Ng0N/Z9RY2V1TLmgu1BS38dt7BzQ5JUxdeqTVKr8V8P"
+     "gzwyvve0K1Gtn7fIS3c4ctzBw7VIScqhdU73eS2dc+wQ0/vgvHjnhXvc1B7qsgXPtY6baujDY97O"
+     "u/SgBRv5l/d+bOc0iK+dieaOmcK9Uzp9HgOE2qWCXLX55Mn50o3n6dYre4eeO/HpST1/29k9umDk"
+     "uB/x2ns7iNp6XHBoxy5a/fjFBz/4vG7ag+6qpZa4aktbzNuf+OkTVzZ2DanbrK9x3tVMydaabv2Z"
+     "5ccnrhl/GdB11t9LOvKk05vqkTOkKdhH8Ac9s9XvdiP/0IxPjMOOf90s5aeuWtZ+1lSll05/oyjp"
+     "L+aN4PLus3drqiU3n4PmSbOE+6Z0+jwGCDUzJ7n+wknTCmuvvTqb1CU6fUbpztfvD2XCosMmbkM9"
+     "nafYTT6V5vFHb2YZabzmjTufKhtk8xoma5uDtcOuOyTVV059v5AMLkUhajHXeUhSqbff+lOiZSf3"
+     "T7jIpuUpnRWz2+zdWOrrqklN04atlbHny6dOHkl9f76wVuyv7XfzpnXzyJznh591JtzyE14HcmOu"
+     "btOVe1+zSxOXrp2J5o6Z0J5pnUmOGQA1h0FfEIdjL87FDx7LYZ0wYsKknnhjvX7+5zNOHSH9D53s"
+     "i6Wjx/1wcOXhha1H7ZCpdX1899JV+UFpKbBhGWOmbw95cuzqRi5W4GJLlSA26rHHnF2T/sXT7HkT"
+     "VEpn3987evKh2SS6/JG1Xkzh4PNsIrt9/NvDmv2nt1wj+Rh73LKJ0pI5/2ifeib0nePeZkv73tLi"
+     "1u5+7d457pt/EZo7Zip6pnWmOSYl0JAMd1uXHnLZ5li1/4ofrvwqsYfOHlnHYzM+cZec1KKlzlON"
+     "32/21mrvuGZVobX1pMMr/Nx1T9Yy3M8Gjm4fU6Dy/ePToWxFpAbK/wiVel97x66N/MltcwefPSHg"
+     "ded2xkeeuzmSDw//XOC1MHY+ednpk7v2KeCNBX+yRSrtdtsI0CNzn2qf3iH8+ti3iJqOvGxwsmzc"
+     "bfvkqW/+LGrqmKnaM70zzTOEiFoC3x9qdcspx1p/z4rtbnmyd/gJk1r6X5jzFOHCk9qp657JrPf9"
+     "POPemPs3dj7aY2EYlK6/bXX7sKSaEB9y8mai71xzV9iS1gPiuNZ2yBHspNbww3y6qvPmDxrOnBHR"
+     "mnP/Puj08RmqXX+eC/P1pHjcXBi31/J7fxLRq7+9z+QGrdj/5hFKj859on3GpDRYfvSneWzzm18E"
+     "yW/u/9tuBZQWzETTpFmCnhkL07xRT0wtto4A5WC/qbumca3puCW1X0zbxcaPHp3CX3DSRrTy7nNp"
+     "o382O3vTgg+NuFzhzcFW77ieD9tOyqaeGd0W6sp7539VbIrroQeqoyYcnZNAXC35x2MvvC1DJ08j"
+     "6T77oS0n/wpSPnlpksvW4sEnXkYm3eX9+/YN5L0Ft9ugccX+t7UTPXr1E8POnliP3j6xdfdBI0a3"
+     "ph8csPrJnXJSXjALTZNmCXrPXljPG/XENDRMQkhcaTp0ej4va8a+mJ18dk71vb2qXi46aTh9dff5"
+     "wRmXBc5edf3qxtwXma0ezyrfs2DYOaM5CeuRarLuidtetFG2ZsNaGsbFAw/fI2/ELfrk8Re96W+f"
+     "cpb3pakP/njKvkLr9vsIg1QruVMu18TusPyen+bcV7dexRm7bvS9ww0vm/dk29kT0+DFidud/gMO"
+     "ZOUfL5and46kfN0sNE28SKj3vL/Wcpa8GhoagJ1oHLf9elizvnfPih2nH+6Zu45+LpVLT2znVX+e"
+     "0XDvfoHonBvS0ZsvDw88TSW+4/dN4340rFVU3v+88sljL6NY53ITx2Jq1cZ9pu7A6o99vkeyiAfN"
+     "mGSlf+Lf9py6Z5pdt+MXhYxm+nHyVRJnDnxh7qEtrvzARWuzSX30vSOYl179dNu0ycovTDDj94vS"
+     "1c/f8FH62G4h+q+dieYJF4F6L/xLORcYr0ytEsXK6tMkzbTYVXWd2jHUZVVumFnxl4wbxqv+fE7j"
+     "X/ayTs+7ueX4I5PsKErTD657MNhy872OEednL632lWAbamFva81lqFqXoVNPp6A2dml/wdTyzZcd"
+     "nEX5jAd3nHJgmu3b6/0M2bBqxl2txo1bfOwZ30Py+i3LujRz/IWtgoeveq6t46wAr530zt67NyYf"
+     "PvMBy7IfR9Q/fyaaJ1wEKs26pycbWRGiYXGm34QOQVwN0jSw6exJGRJPrxxQldkntWH13ecEi/YK"
+     "SS/5PY0Z3xpRkn7w3N3vsxQOuiUPdPx1tSlkU4dieehayZuYbXXMjYhw/7Wv1ikz7IBz20lLE/++"
+     "yfixUdJ7zLOuNapUimOvBFdOeHibS/YocO3d+57hER07ZEiWzHm2Zeylkbx33OsW3kaVbDV8dIcc"
+     "SgtmoWniTEbfxfd2ZzJGhakNqlBAjRFe09odzz9NQzHJmz8ty+xxbbTqnrPD236ZgXvwmudbdt9p"
+     "SFB997V3SnmqmO07hyu9OP61RlsPg6jshlTYCYysaescDSR33PkhbXH80cVqjkpTOmncuY1UmT9T"
+     "hoblyuBxV1jghAeqYyf8MFQvX+mw0AWkz1+zKLf1cyZe8etXc1q3xhfXYdnuGV++/mJtnDLd0rqL"
+     "F63J5qsGGWoDFIB6V0izYlclcyfaJCnqe3t36exxw2jFHy8sbLck78zbly80dWUIQqeZAlVGPLC1"
+     "0rrD3mzsL+Vttm4gqtYJuoPdHwfQ/erL4X7bxTmQ/3TWoz1HXLFRYpaN8YXQ1AafMlOJTlrc7S8+"
+     "YVgoEuc0zVDC/7h6MUY8uyneGv9imhvky+2fWH5416xUFpxPrROn+EL9grtWZYtsfUJtWE81320b"
+     "e/t07kSSwPPre9Vk9th2/uymKzD0oe1Cl1wxLyZVGEhESRDVht3w0yAOj1icgBDkstnugjfqGL1x"
+     "+NuDh5HhWLO9rxR2dbbr3AdK23ecILH8/EVy0LbTLlRK9nklNe0/2eUHW0blFQ/I5I2N3jvnPddy"
+     "4fgKT34wTqs2qAHB0p0Kaf8NM82w0y4Aei74a6kQuXoO1AoQvkZBrzR1p+70yaOY4BeOreHyE1vk"
+     "y8UPvJ3sftMwwpc3LujnTBU7HDDkxX/2cbVx0vlJqHf+vbcN/3rftJnugmeC0UopiA7cY8uNTVp5"
+     "d8nyn1wVSP/CpS+tGX3OgYp/PXTHoNWr2k69CJC7rvqiKtl8LvA2/Hire0axvHDXP1f3bNq5Ob/0"
+     "u0fXadsBOz74OJ7dOZLk3vnVtcfPkyD588JXunKDXBRTCwYQoMKMqBz1juo4Oqpn/n3moy6YdWI7"
+     "0tKapyYNPaRjC/Kr3vr3Wjt4yGaj+q7uRKEU77CMctq7JrFf/eU2GlGPrQoboaivasOGsBD4pL+v"
+     "2DGNtVpd2/mnL7c96pCR9d6u1XMfHXLKLFhXffLRzl5J2URVTva/dZjhcvdHd9+R+d7dm6crvurT"
+     "fFvjog55ZnQAdC1/bMFRN4C097U/PKQNaVapBesRXCF1Mqi7fsRZ22q8+NSKbzjn+BE+Zf/sz8Ih"
+     "R/7me0biSsxhGGReu+SxIFOL25Zu6Qyryhd3XsptcSiUSiBpg/QN7kvSSFPmpOXy48g6U1987fP5"
+     "4YeMHcXUPWnRxqfMEAaXFty+OqMJo27o8Ctbhcl/9qfLff7M4zeh1DObeufJvOTHIVi7Hpg57ipU"
+     "M/jy+j+XgySXpVYMUMAE1VwlCYq1vtZdt+I1bz0z1Ll9dszVJBd9Po942J77bzOksVHqsfvkvacf"
+     "78qbeqK/2vOLQahwvvL8I2GOckKpBKhSoHHR9NYpQ7W08aBffrmWB9vlT31IZthWIzYv2DteGrzH"
+     "QT39ppkfeqkSZa0oVepb/3pQzIlLX17iGptG/2Lz4Q2VNb1fPXkrTRwVl5Ns9p3OvX++ujJ4UP9j"
+     "L2gRRmiYQgEFc5yrSsi20h8NQr+qDfoaippSxqTVVbkQm2w8tKkAV62s/PyL1JAi8G5ET0Zjm/U9"
+     "pUG1ghXxbAz6g1w5Ms6T8TUJMqPW9EURVyv1JFc2YWuU+aqOaFhvzeZ5tQRqIy+m32WbjaNUw3Xr"
+     "JOODH7Q3Z9P+7r6Vn/OIfFx1YYP7rGnoOh/lpK9ExYASGqYYoFCVQI0mka8JKbKmmomdiCi0OPir"
+     "QVFvTcMITEksgSlwqhRSd6Be1BiwyVczUK9GOKpzoAnUWnHwNU8egVfKBNV8lWOxEuaSeq4WZwDK"
+     "R15YhB1pRRjKxrMirDlRBCZGZNjBO+UoTJQ8vOXQiDXGUxvWU4WGtp5YVqxnVbzzXnhIyeVMLRYi"
+     "MDw4RwMgzkmDc17ZWhZAAQVE2EBg0c9ZUpOWiiICYrZIKXIVZNOM1MKGWl+BQCAoFAzxHkwAg4ko"
+     "TepKDKFCIEJp3duQicSLhEwEAoFasYFCrU2SgBTrGVKFKiiKJTIuVYYqQ9k6IYaKSFZFlYjhsYEq"
+     "MQQWNROKC6iWE4ESMdSTlTqFPtDUZpJq1gGEAUpEogoiJYAAMt4JM6lwIGo1BQ2AigqBAAJALVhP"
+     "AeEgdZaxQQIQMUAQMKuCxClbqNJ/QLVOBFIFDNZjKFgVbFJjUheEqUAxgERArELsiITYi2UQYYAo"
+     "ExQEKADF1xREgNYDD0vChP9QxX/RcPwvIeO9VY/1DAgggiYGXonBxitZcuIURAQCExOpqAIggOAF"
+     "SqqgwBM5HwTiCF9TEJOASWiAehiqEQgDVIgAEIxRDFCkIIKCiG0qFmLUAUoADCmgACjAf7GD9WoM"
+     "YT3BAAUotHCeGd4DIIgQAQQQPBFBoSIAgYDAAKqAGg9SZRYlAqDqhdWTgTfKxqccioIIgBIpAFJ4"
+     "jwEEBIZIRQneJJ6hbFmhBKJEAIUC/wMjs1Ohu9ui7wAAAABJRU5ErkJggg=="),
     ("NEG:db-sudharo-1",
      "iVBORw0KGgoAAAANSUhEUgAAAK4AAAApCAAAAACJ0k1SAAATxUlEQVRYCbXBd3yUVboA4Pc953zf"
      "zGQmhRBMg0ASSmgiC3FYrBS9Sk0oOyiCAiIiYosCd2HVRYoISA9IXxAEaSKCoKBAQgIiIAKhE0pI"
@@ -1918,7 +2080,15 @@ class PageDownloader:
     def __init__(self, reporter: ProgressReporter):
         self._reporter = reporter
         self._cache_dir = tempfile.mkdtemp(prefix="pne_cache_")
-        self._image_cache: Dict[str, "np.ndarray"] = {}
+        # Bounded, and small on purpose.  A decoded newspaper page is ~22 MB
+        # (2300x3200x3), each agent walks its whole edition once, and every
+        # agent has its own downloader: an unbounded cache meant 18 pages x 8
+        # agents ~= 3 GB of pages nobody was going to look at again.  The raw
+        # bytes stay in the on-disk cache, so the only cost of a miss is a
+        # re-decode (~0.1 s), and the one caller that does re-fetch a URL
+        # (the Divya Bhaskar CDN probe) asks for it again immediately.
+        self._image_cache: "collections.OrderedDict[str, np.ndarray]" = \
+            collections.OrderedDict()
         # A cookie jar carried across the whole session: seeded from any
         # stored login cookie and auto-updated from Set-Cookie responses, so
         # a token the site refreshes mid-visit is reused for later requests.
@@ -2026,10 +2196,13 @@ class PageDownloader:
     def fetch_image(self, url: str, *, referer: Optional[str] = None,
                     extra_headers: Optional[Dict[str, str]] = None
                     ) -> "np.ndarray":
-        """Download and decode an image (BGR).  Cached per session.
-        Safe to call from several threads at once."""
+        """Download and decode an image (BGR).  Safe to call from several
+        threads at once; the last few decoded pages are kept (see
+        IMAGE_CACHE_MAX)."""
         with self._lock:
             cached = self._image_cache.get(url)
+            if cached is not None:
+                self._image_cache.move_to_end(url)
         if cached is not None:
             return cached
         data = self.fetch_bytes(url, referer=referer,
@@ -2040,6 +2213,8 @@ class PageDownloader:
             raise ExtractionError(f"Could not decode image: {url}")
         with self._lock:
             self._image_cache[url] = img
+            while len(self._image_cache) > IMAGE_CACHE_MAX:
+                self._image_cache.popitem(last=False)   # oldest out
         return img
 
 
@@ -2185,6 +2360,11 @@ class BaseOcrEngine:
 
     name = "none"
     supports_gujarati = False
+    #: Language the full-page sweep should use, when the engine has a choice.
+    #: The sweep only ever looks for Gujarati title words, so an engine that
+    #: normally reads several languages can drop the rest here.  None = the
+    #: engine's usual setting.
+    sweep_lang: Optional[str] = None
 
     def read_text(self, gray: "np.ndarray",
                   early_stop: Optional[Callable[[str], bool]] = None) -> str:
@@ -2194,9 +2374,14 @@ class BaseOcrEngine:
         skip its remaining (slower) passes once the answer is already in."""
         raise NotImplementedError
 
-    def read_words(self, gray: "np.ndarray") -> List[OcrWord]:
+    def read_words(self, gray: "np.ndarray",
+                   lang: Optional[str] = None) -> List[OcrWord]:
         """OCR a full page and return positioned words (used by the
-        full-page sweep on pages where nothing else was found)."""
+        full-page sweep on pages where nothing else was found, and by
+        Find-text on the cropped notices).
+
+        `lang` overrides the engine's language for this call; engines with
+        only one language ignore it."""
         raise NotImplementedError
 
 
@@ -2209,6 +2394,9 @@ class TesseractOcrEngine(BaseOcrEngine):
     def __init__(self, lang: str, supports_gujarati: bool):
         self.lang = lang
         self.supports_gujarati = supports_gujarati
+        # The page sweep hunts Gujarati title words only; loading the English
+        # model alongside them cost 14 s a page and found nothing extra.
+        self.sweep_lang = "guj" if supports_gujarati else lang
 
     @staticmethod
     def find_binary() -> Optional[str]:
@@ -2307,12 +2495,13 @@ class TesseractOcrEngine(BaseOcrEngine):
                 break
         return "\n".join(pieces)
 
-    def read_words(self, gray: "np.ndarray") -> List[OcrWord]:
+    def read_words(self, gray: "np.ndarray",
+                   lang: Optional[str] = None) -> List[OcrWord]:
         words: List[OcrWord] = []
         try:
             # psm 11: sparse text - finds isolated headlines on a full page.
             data = pytesseract.image_to_data(
-                gray, lang=self.lang, config="--psm 11",
+                gray, lang=lang or self.lang, config="--psm 11",
                 output_type=pytesseract.Output.DICT)
         except Exception:
             return words
@@ -2488,8 +2677,9 @@ class WindowsOcrEngine(BaseOcrEngine):
         words, _ = self._recognize(gray)
         return " ".join(w.text for w in words)
 
-    def read_words(self, gray: "np.ndarray") -> List[OcrWord]:
-        words, _ = self._recognize(gray)
+    def read_words(self, gray: "np.ndarray",
+                   lang: Optional[str] = None) -> List[OcrWord]:
+        words, _ = self._recognize(gray)      # one language per engine
         return words
 
 
@@ -2570,8 +2760,9 @@ class EasyOcrEngine(BaseOcrEngine):
                   ) -> str:   # single pass - early_stop has no work
         return " ".join(w.text for w in self._read(gray))
 
-    def read_words(self, gray: "np.ndarray") -> List[OcrWord]:
-        return self._read(gray)
+    def read_words(self, gray: "np.ndarray",
+                   lang: Optional[str] = None) -> List[OcrWord]:
+        return self._read(gray)               # reader is built per language
 
 
 def validate_ocr_setup() -> Tuple[List[str], List[str]]:
@@ -2874,6 +3065,11 @@ class HeaderTemplateVerifier:
             List[Tuple[str, "np.ndarray"]] = []
         self.have_gujarati_font = False
         self.have_embedded = False
+        #: Subset page_scan sweeps with - see _select_scan_templates().
+        self.scan_templates: List[Tuple[str, "np.ndarray"]] = []
+        #: Notice types that have a REAL cropped template loaded here
+        #: ("notice", "chetavni") - see gate_is_calibrated().
+        self.embedded_families: set = set()
         self._build_templates()
 
     # -- template construction ------------------------------------------------
@@ -2918,10 +3114,14 @@ class HeaderTemplateVerifier:
             # only, never as positive matchers.
             is_negative = label.startswith("NEG:")
             base_label = label[4:] if is_negative else label
-            # The embedded positives are all જાહેર નોટિસ crops - in
-            # chetavni-only mode they must not accept boxes.
-            if not is_negative and active_notice_type() == "chetavni":
-                continue
+            # Load only the crops for the notice type this run wants.  This
+            # used to drop EVERY embedded positive in chetavni mode, which
+            # was right when they were all જાહેર નોટિસ crops and wrong now
+            # that a real ચેતવણી one exists.
+            if not is_negative:
+                mode = active_notice_type()
+                if mode != "all" and mode != self._family_of(base_label):
+                    continue
             # Negative (veto) templates load for EVERY pipeline - a tender /
             # auction / સુધારો header is unwanted in every newspaper.  Only
             # POSITIVE templates are filtered by this paper's prefixes.
@@ -2939,6 +3139,11 @@ class HeaderTemplateVerifier:
                             (base_label, template))
                     else:
                         self.templates.append((label, template))
+                        # Which notice type this real crop can match, taken
+                        # from its name - see gate_is_calibrated().
+                        self.embedded_families.add(
+                            "chetavni" if "chetavni" in base_label
+                            else "notice")
             except Exception:
                 continue
         self.have_embedded = bool(self.templates)
@@ -3000,10 +3205,69 @@ class HeaderTemplateVerifier:
         if not self.templates:
             self._reporter.log(
                 "No header templates could be loaded.", "warn")
+        self.scan_templates = self._select_scan_templates()
+
+    @staticmethod
+    def _family_of(label: str) -> str:
+        """Which notice type a template matches, from its label."""
+        return "chetavni" if ("ચેતવણ" in label or "chetavni" in label) \
+            else "notice"
+
+    def _select_scan_templates(self) -> List[Tuple[str, "np.ndarray"]]:
+        """The templates page_scan sweeps a whole page with.
+
+        Capped for speed - a full-page matchTemplate per template per scale
+        is the second most expensive thing here - but the cap used to be a
+        blind templates[:6].  Every જાહેર ચેતવણી template lands at index 10+
+        (embedded crops first, then every નોટિસ spelling in two fonts), so
+        the page sweep never once looked for ચેતવણી in ANY newspaper.  The
+        budget is now split across the notice types the run actually wants.
+        """
+        by_family: Dict[str, List[Tuple[str, "np.ndarray"]]] = {}
+        for label, template in self.templates:
+            by_family.setdefault(self._family_of(label), []).append(
+                (label, template))
+        mode = active_notice_type()
+        active = [f for f in ("notice", "chetavni")
+                  if f in by_family and mode in ("all", f)]
+        if not active:
+            return self.templates[:PAGE_SCAN_TEMPLATES]
+
+        share = max(1, PAGE_SCAN_TEMPLATES // len(active))
+        chosen: List[Tuple[str, "np.ndarray"]] = []
+        taken: set = set()
+        for family in active:
+            for item in by_family[family][:share]:
+                chosen.append(item)
+                taken.add(item[0])
+        # Spare slots go back to the original priority order (real-paper
+        # crops first).  Compared by label: these tuples hold arrays, and
+        # `in` on those raises rather than answering.
+        for item in self.templates:
+            if len(chosen) >= PAGE_SCAN_TEMPLATES:
+                break
+            if item[0] not in taken:
+                chosen.append(item)
+                taken.add(item[0])
+        return chosen[:PAGE_SCAN_TEMPLATES]
 
     @property
     def has_templates(self) -> bool:
         return bool(self.templates)
+
+    @property
+    def gate_is_calibrated(self) -> bool:
+        """May a low template score be trusted to mean "no notice here"?
+
+        Only when every notice type this run is looking for has a real
+        cropped template loaded.  Font-rendered templates score much lower
+        than real-paper crops, so without one a low score means "no template
+        for this", not "nothing on the page" - and skipping the OCR sweep on
+        that basis would quietly lose exactly the notices it exists to find.
+        """
+        mode = active_notice_type()
+        wanted = {"notice", "chetavni"} if mode == "all" else {mode}
+        return wanted <= self.embedded_families
 
     @property
     def gujarati_capable(self) -> bool:
@@ -3080,8 +3344,9 @@ class HeaderTemplateVerifier:
                     continue
                 resized = cv2.resize(template, (tw, target_h),
                                      interpolation=cv2.INTER_AREA)
-                result = np.abs(cv2.matchTemplate(gray, resized,
-                                                  cv2.TM_CCOEFF_NORMED))
+                result = cv2.matchTemplate(gray, resized,
+                                           cv2.TM_CCOEFF_NORMED)
+                np.abs(result, out=result)    # in place: the copy is ~11 MB
                 ys, xs = np.where(result >= STRONG_NEGATIVE_PAGE_THRESHOLD)
                 for x, y in zip(xs.tolist(), ys.tolist()):
                     hits.append((x, y, tw, target_h, float(result[y, x])))
@@ -3094,9 +3359,14 @@ class HeaderTemplateVerifier:
         (x, y, w, h, score).  Only the first (highest-priority) few templates
         are used to keep this fast."""
         hits: List[Tuple[int, int, int, int, float]] = []
+        #: Best score seen anywhere in this scan, hits or not.  Free (the
+        #: match map is computed either way) and it tells the caller whether
+        #: the page holds anything header-shaped at all - see
+        #: OCR_SWEEP_MIN_TEMPLATE.
+        self.last_scan_best = 0.0
         if not self.templates:
             return hits
-        for _, template in self.templates[:6]:
+        for _, template in self.scan_templates:
             if self._reporter is not None:
                 self._reporter.check_cancel()
             th0, tw0 = template.shape[:2]
@@ -3108,8 +3378,12 @@ class HeaderTemplateVerifier:
                     continue
                 resized = cv2.resize(template, (tw, target_h),
                                      interpolation=cv2.INTER_AREA)
-                result = np.abs(cv2.matchTemplate(gray, resized,
-                                                  cv2.TM_CCOEFF_NORMED))
+                result = cv2.matchTemplate(gray, resized,
+                                           cv2.TM_CCOEFF_NORMED)
+                np.abs(result, out=result)    # in place: the copy is ~11 MB
+                if result.size:
+                    self.last_scan_best = max(self.last_scan_best,
+                                              float(result.max()))
                 ys, xs = np.where(result >= threshold)
                 for x, y in zip(xs.tolist(), ys.tolist()):
                     hits.append((x, y, tw, target_h, float(result[y, x])))
@@ -3459,14 +3733,32 @@ class NoticeDetectionPipeline:
 
         # --- Pass 2: full-page template sweep (broken borders) --------------
         hits = self.verifier.page_scan(gray, cfg.page_match_threshold)
+        # Captured now: _split_merged below scans sub-regions and would
+        # overwrite it.
+        page_best = self.verifier.last_scan_best
         self._attach_hits(hits, detections, all_rects, gray, "page-scan")
 
         # --- Pass 3: full-page OCR sweep on empty pages (safety net) --------
+        # Gated on the template evidence, because this pass is the single
+        # most expensive thing the app does.  Measured over a whole Sandesh
+        # edition: it ran on 12 of 18 pages, cost 242 s of a 675 s run and
+        # found NOTHING - every notice came from the box/template passes.
+        # On that edition the best template score was 0.597-0.848 on pages
+        # holding a notice and never above 0.590 on a page holding none, so
+        # a page with no header-shaped ink anywhere is not worth an OCR pass.
         if not detections and self._ocr is not None:
-            self._reporter.log("  Deep scan: full-page OCR sweep...", "dim")
-            ocr_hits = self._ocr_page_sweep(gray)
-            self._attach_hits(ocr_hits, detections, all_rects, gray,
-                              "ocr-sweep")
+            if page_best < OCR_SWEEP_MIN_TEMPLATE and \
+                    self.verifier.gate_is_calibrated:
+                self._reporter.log(
+                    f"  Nothing header-shaped on this page "
+                    f"(best {page_best:.2f}) - skipping the deep scan.",
+                    "dim")
+            else:
+                self._reporter.log("  Deep scan: full-page OCR sweep...",
+                                   "dim")
+                ocr_hits = self._ocr_page_sweep(gray)
+                self._attach_hits(ocr_hits, detections, all_rects, gray,
+                                  "ocr-sweep")
 
         # Drop borderline low-confidence matches (stray photos, tables) -
         # box+ocr detections carry their own OCR confidence and are exempt.
@@ -3761,9 +4053,15 @@ class NoticeDetectionPipeline:
         Looks for "જાહેર" followed by "નોટિસ" on the same line (and the
         single-word / English forms)."""
         # This safety net runs on MOST pages (every page with no detections),
-        # so its cost dominates a run.  Two cuts, benchmarked together:
+        # so its cost dominates a run.  Measured on one real Sandesh page
+        # (2332x3231), the sweep alone was 31.9 s.  Three cuts:
+        #   * Gujarati only.  The engine reads guj+eng so that Find-text can
+        #     match English inside a notice, but this sweep looks for
+        #     "જાહેર"/"નોટિસ" and nothing else - carrying the English model
+        #     doubled the work for no extra hit.  31.9 s -> 17.6 s.
         #   * OCR a downscaled copy - notice titles are display-size glyphs
         #     and survive it; Tesseract time scales with pixel count.
+        #     17.6 s -> 9.0 s at 900 px.
         #   * hand the detect slot back while the subprocess runs, so some
         #     other agent's template matching proceeds instead of idling.
         img = gray
@@ -3775,7 +4073,8 @@ class NoticeDetectionPipeline:
                              interpolation=cv2.INTER_AREA)
         try:
             with detect_gate_released():
-                words = self._ocr.read_words(img)
+                words = self._ocr.read_words(
+                    img, lang=getattr(self._ocr, "sweep_lang", None))
         except Exception as exc:
             self._reporter.log(f"  OCR sweep failed: {exc}", "warn")
             return []
@@ -3792,7 +4091,8 @@ class NoticeDetectionPipeline:
 
         # Single words already containing the full title (e.g. જાહેરનોટિસ).
         mode = active_notice_type()
-        singles = [] if mode == "chetavni" else list(SWEEP_SINGLE_WORDS)
+        singles = [word for word, kind in SWEEP_SINGLE_WORDS
+                   if mode == "all" or mode == kind]
         if self._broad:
             singles += ["નોટિસ", "નોટીસ", "notice"]
         for norm, word in normalized:
@@ -4084,21 +4384,57 @@ class BaseNewspaperExtractor:
                 found_here = 0
                 failed_pages: List[int] = []
 
-                # Pages are downloaded a few ahead of the detector so the
-                # network and the CPU work at the same time.
+                # Pages of ONE edition run in parallel too - not just the
+                # editions.  A single-newspaper run used to leave five of the
+                # six detect slots idle and take 18 pages x 10 s in a row.
+                # Fetch + detect + crop is one unit of work per page; results
+                # are consumed IN PAGE ORDER, so the gallery still reads
+                # page 1, 2, 3 no matter which worker finished first.
+                #
+                # Each worker thread builds its own pipeline (60 ms): a
+                # pipeline carries per-page state - the working scale that
+                # crop() reads back, and the line masks - so sharing one
+                # across threads would hand crops the wrong scale.
+                local = threading.local()
+                want_debug = self.debug_on_zero
+
+                def _page_pipeline():
+                    made = getattr(local, "pipeline", None)
+                    if made is None:
+                        made = self.pipeline_cls(reporter=reporter,
+                                                 ocr_engine=ocr_engine,
+                                                 broad=self.broad)
+                        local.pipeline = made
+                    return made
+
+                def _work(target: PageRef):
+                    """One page, on a worker thread.  Silent: the consumer
+                    does the logging so the log stays in page order."""
+                    pipe = _page_pipeline()
+                    image = self.fetch_page(downloader, target, reporter)
+                    found = pipe.detect(image)
+                    crops = [pipe.crop(image, det) for det in found]
+                    scores = list(pipe.last_candidate_scores)
+                    # The full page is only worth carrying when a zero-result
+                    # diagnostic might want it; otherwise it is 22 MB held
+                    # for nothing.
+                    return (image if want_debug else None), found, crops, \
+                        scores
+
+                lookahead = page_workers()
                 pool = concurrent.futures.ThreadPoolExecutor(
-                    max_workers=PAGE_PREFETCH,
-                    thread_name_prefix="page-fetch")
+                    max_workers=lookahead, thread_name_prefix="page")
                 futures: Dict[int, "concurrent.futures.Future"] = {}
                 next_submit = 0
 
                 def _pump() -> None:
+                    """Keep `lookahead` pages in flight, no more: each one in
+                    flight is a decoded page held in memory."""
                     nonlocal next_submit
                     while (next_submit < len(pages)
-                           and len(futures) < PAGE_PREFETCH):
-                        target = pages[next_submit]
+                           and len(futures) < lookahead):
                         futures[next_submit] = pool.submit(
-                            self.fetch_page, downloader, target, reporter)
+                            _work, pages[next_submit])
                         next_submit += 1
 
                 try:
@@ -4110,15 +4446,15 @@ class BaseNewspaperExtractor:
                     reporter.phase(f"{prefix}Page {page.page_number}"
                                    f" / {total}")
 
-                    # -- Download (already running in the background) --------
                     try:
                         future = futures.pop(index, None)
                         if future is None:
-                            image = self.fetch_page(downloader, page,
-                                                    reporter)
+                            image, detections, crops, scores = _work(page)
                         else:
-                            image = future.result()
+                            image, detections, crops, scores = future.result()
                         _pump()
+                    except ExtractionCancelled:
+                        raise
                     except ExtractionError as exc:
                         if str(exc).startswith("AUTH:"):
                             # One clear message, then stop - grinding
@@ -4130,39 +4466,30 @@ class BaseNewspaperExtractor:
                                 "pages - see the explanation above.")
                         reporter.log(f"  SKIPPED - {exc}", "error")
                         failed_pages.append(page.page_number)
-                        if self.debug_on_zero and found_total == 0:
+                        if want_debug and found_total == 0:
                             debug_report.append(
                                 f"page {page.page_number}: SKIPPED "
                                 f"({exc})  src={page.image_url}")
                         reporter.progress(page.page_number, total)
                         continue
-                    reporter.log(f"  Got {image.shape[1]}x{image.shape[0]} px")
-
-                    # -- Detect -----------------------------------------------
-                    reporter.log("  Searching for Public Notices...")
-                    try:
-                        detections = pipeline.detect(image)
-                    except ExtractionCancelled:
-                        raise
                     except Exception as exc:
                         reporter.log(f"  Detection error: {exc}", "error")
                         failed_pages.append(page.page_number)
                         reporter.progress(page.page_number, total)
                         continue
 
-                    if self.debug_on_zero and found_total == 0:
+                    if want_debug and found_total == 0 and image is not None:
                         if len(debug_pages) < 3:
                             debug_pages.append((page.page_number, image))
-                        top = sorted(pipeline.last_candidate_scores,
-                                     reverse=True)[:5]
+                        top = sorted(scores, reverse=True)[:5]
                         debug_report.append(
                             f"page {page.page_number}: "
                             f"{image.shape[1]}x{image.shape[0]}px  "
-                            f"boxes={len(pipeline.last_candidate_scores)}  "
+                            f"boxes={len(scores)}  "
                             f"top_scores={top}  found={len(detections)}  "
                             f"src={page.image_url}")
 
-                    # -- Crop & report ----------------------------------------
+                    # -- Report ------------------------------------------------
                     if not detections:
                         reporter.log("  No Public Notices Found", "dim")
                     else:
@@ -4170,9 +4497,8 @@ class BaseNewspaperExtractor:
                         reporter.log(f"  {count} Public Notice"
                                      f"{'s' if count != 1 else ''} Found",
                                      "success")
-                        reporter.log("  Cropping...")
-                        for idx, det in enumerate(detections, start=1):
-                            crop = pipeline.crop(image, det)
+                        for idx, (det, crop) in enumerate(
+                                zip(detections, crops), start=1):
                             result_id += 1
                             found_total += 1
                             found_here += 1
@@ -4909,6 +5235,12 @@ class GalleryPanel(ttk.LabelFrame):
         self._heading_widget = holder
 
     def _append_card(self, result: NoticeResult) -> None:
+        # "No notices yet - choose a newspaper..." has to go the moment a
+        # real one lands.  _render_page drops it, but this is the live path
+        # that streams a notice straight onto the current page WITHOUT a
+        # redraw - and the cards are placed, not gridded, so the leftover
+        # label just sat there behind them.
+        self._empty_label.grid_forget()
         card = NoticeCard(self._inner, result, self._on_open,
                           self._on_save, self._on_click)
         if id(result) in self._deselected:
@@ -5806,8 +6138,11 @@ class Application(ttk.Frame):
                if cls.days_back_limit else "any date")
             for cls in NEWSPAPER_REGISTRY.values()
             if cls is not local_pdf_extractor())
+        # Row 3, below the notice-type buttons: this is a read-only note, and
+        # it used to be gridded into row 2 as well - two widgets in one cell,
+        # so the buttons were drawn on top of the text.
         ttk.Label(controls, text="Archive: " + limits,
-                  foreground="#7a4a00").grid(row=2, column=0, columnspan=7,
+                  foreground="#7a4a00").grid(row=3, column=0, columnspan=7,
                                              sticky="w", padx=(8, 0),
                                              pady=(0, 6))
 
@@ -5874,8 +6209,8 @@ class Application(ttk.Frame):
             self._type_buttons.append(button)
         self._type_hint = ttk.Label(type_frame, text="", foreground="#0a6b0a")
         self._type_hint.pack(side="left", padx=(10, 0))
-        type_frame.grid(row=2, column=0, columnspan=3, sticky="w",
-                        padx=(8, 0), pady=(0, 6))
+        type_frame.grid(row=2, column=0, columnspan=7, sticky="w",
+                        padx=(8, 0), pady=(0, 2))
 
         self.preview = ImagePreviewPanel(paned)
         paned.add(self.preview, weight=2)
@@ -6321,13 +6656,22 @@ class Application(ttk.Frame):
 
     # -- queue polling (worker -> GUI) ---------------------------------------
     def _poll_queue(self) -> None:
+        """Drain the worker queue in bounded batches.
+
+        Bounded because eight agents can put thousands of messages in one
+        tick, and handling them all before returning to Tk is exactly how a
+        click ends up waiting a second to be noticed.  Hitting the cap
+        reschedules immediately, so nothing is delayed - only interleaved."""
+        drained = 0
         try:
-            while True:
+            while drained < MSG_PER_TICK:
                 message = self._msg_queue.get_nowait()
+                drained += 1
                 self._handle_message(message)
         except queue.Empty:
             pass
-        self.root.after(80, self._poll_queue)
+        self.root.after(1 if drained >= MSG_PER_TICK else POLL_INTERVAL_MS,
+                        self._poll_queue)
 
     def _handle_message(self, message: tuple) -> None:
         kind = message[0]

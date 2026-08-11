@@ -14,19 +14,24 @@ Status Log fixes (v1.36) - it used to be there but unusable:
     sliver again.
   * Auto-scroll to the newest line, unless the user has scrolled up to read
     something (then it stays put instead of yanking the view away).
+  * Lines are drawn in batches (v1.37), because eight agents log faster than
+    Tk can paint and the per-line path made every button feel stuck.
 """
 
 from __future__ import annotations
 
 import tkinter as tk
 from tkinter import scrolledtext, ttk
-from typing import Callable, Optional
+from typing import Callable, List, Optional, Tuple
 
 from .. import config
 
 #: Width the log pane opens at, and the narrowest it may be squeezed to.
 LOG_PANE_WIDTH = 360
 LOG_PANE_MIN_WIDTH = 240
+#: How often queued log lines are drawn.  Long enough to batch a burst,
+#: short enough that the log still reads as live.
+LOG_FLUSH_MS = 120
 
 
 class StatusLogPanel(ttk.LabelFrame):
@@ -60,20 +65,60 @@ class StatusLogPanel(ttk.LabelFrame):
                               ("success", "#0a6b0a")):
             self._text.tag_configure(level, foreground=colour)
 
+        #: Lines waiting to be drawn, and the pending flush callback.
+        self._pending: List[Tuple[str, str]] = []
+        self._flush_job = None
+
     # -- logging --------------------------------------------------------------
     def log(self, message: str, level: str = "info") -> None:
+        """Queue a line.  Drawing is batched - see _flush.
+
+        Eight edition agents log faster than Tk can paint, and the old
+        one-insert-per-line path re-measured the whole widget every time
+        (`index("end-1c")` walks it), which is what made buttons feel stuck
+        during a run."""
+        self._pending.append((message, level))
+        if self._flush_job is None:
+            try:
+                self._flush_job = self.after(LOG_FLUSH_MS, self._flush)
+            except tk.TclError:               # window closing
+                self._pending.clear()
+
+    def _flush(self) -> None:
+        """Draw everything queued in as few inserts as possible."""
+        self._flush_job = None
+        if not self._pending:
+            return
+        pending, self._pending = self._pending, []
         follow = self._at_bottom()
-        self._text.configure(state="normal")
-        self._text.insert("end", message + "\n", (level,))
-        # Trim very long logs so memory stays bounded.
-        line_count = int(self._text.index("end-1c").split(".")[0])
-        if line_count > config.LOG_MAX_LINES:
-            self._text.delete("1.0", f"{line_count - config.LOG_MAX_LINES}.0")
-        self._text.configure(state="disabled")
-        if follow:
-            self._text.yview_moveto(1.0)
+        try:
+            self._text.configure(state="normal")
+            # Consecutive lines of the same level share one insert: a burst
+            # from a single agent is usually one colour all the way down.
+            run_level = pending[0][1]
+            chunk: List[str] = []
+            for message, level in pending:
+                if level != run_level and chunk:
+                    self._text.insert("end", "".join(chunk), (run_level,))
+                    chunk = []
+                run_level = level
+                chunk.append(message + "\n")
+            if chunk:
+                self._text.insert("end", "".join(chunk), (run_level,))
+
+            # Trim once per flush, not once per line.
+            line_count = int(self._text.index("end-1c").split(".")[0])
+            if line_count > config.LOG_MAX_LINES:
+                self._text.delete(
+                    "1.0", f"{line_count - config.LOG_MAX_LINES}.0")
+            self._text.configure(state="disabled")
+            if follow:
+                self._text.yview_moveto(1.0)
+        except tk.TclError:
+            pass                              # window went away mid-flush
 
     def clear(self) -> None:
+        self._pending.clear()
         self._text.configure(state="normal")
         self._text.delete("1.0", "end")
         self._text.configure(state="disabled")

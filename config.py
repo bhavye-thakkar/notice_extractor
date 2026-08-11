@@ -106,7 +106,14 @@ PERSISTENT_NAMES: tuple = ("browser_profile", "divyabhaskar_session.txt",
 
 
 def clear_run_data() -> list:
-    """Delete this run's leftovers.  Returns what was removed."""
+    """Delete this run's leftovers.  Returns the folders that went.
+
+    A folder can survive: Windows will not delete a file another process has
+    open, so a headless run going on in parallel keeps its own log. That is
+    why this reports what it managed rather than asserting success."""
+    from .utils import logger        # late: logger imports config
+    logger.close()                   # our own handle would block logs/
+
     removed = []
     for name in TRANSIENT_DIRS:
         path = os.path.join(DATA_DIR, name)

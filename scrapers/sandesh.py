@@ -199,7 +199,7 @@ class SandeshPipeline(NoticeDetectionPipeline):
     backup (the typefaces are close), with slightly softer thresholds."""
     newspaper_name = "Sandesh"
     default_config = SANDESH_DETECTION_CONFIG
-    embedded_prefixes = ("sandesh-", "gs-")
+    embedded_prefixes = ("sandesh-", "gs-", "chetavni-")
 
 
 class SandeshExtractor(BaseNewspaperExtractor):

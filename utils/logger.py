@@ -23,6 +23,9 @@ from .. import config
 _lock = threading.Lock()
 _handle: Optional[TextIO] = None
 _path: str = ""
+#: Writes are buffered and flushed at most this often (see log()).
+FLUSH_EVERY_SECONDS = 0.5
+_last_flush = [0.0]
 
 
 def log_path() -> str:
@@ -49,7 +52,14 @@ def log(message: str, level: str = "info") -> None:
             assert _handle is not None
             for line in (message or "").splitlines() or [""]:
                 _handle.write(f"{stamp} {tag} {line}\n")
-            _handle.flush()
+            # Flushed on a timer, not per line: this runs on the Tk thread
+            # for every line the GUI shows, and a syscall per line during a
+            # run is a lag the user feels on every click.  Half a second
+            # still means "tail the file while it runs".
+            now = time.monotonic()
+            if now - _last_flush[0] >= FLUSH_EVERY_SECONDS:
+                _handle.flush()
+                _last_flush[0] = now
     except Exception:
         pass
 
@@ -58,6 +68,16 @@ def banner(text: str) -> None:
     log("=" * 70)
     log(text)
     log("=" * 70)
+
+
+def flush() -> None:
+    """Force buffered lines out (used before reading the file back)."""
+    with _lock:
+        if _handle is not None:
+            try:
+                _handle.flush()
+            except Exception:
+                pass
 
 
 def close() -> None:
