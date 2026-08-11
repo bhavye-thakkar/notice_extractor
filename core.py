@@ -247,7 +247,22 @@ def app_dir() -> str:
 
 
 def local_tessdata_dir() -> str:
-    return os.path.join(app_dir(), LOCAL_TESSDATA_DIRNAME)
+    """The folder holding guj.traineddata.
+
+    Looked up, not assumed: tessdata/ can sit beside the package (project
+    root) or inside it (which is what makes the git repo self-contained).
+    Whichever one actually holds the model wins, so moving the folder cannot
+    silently turn Gujarati OCR off - the failure mode is invisible, because
+    detection just quietly finds less.
+
+    Neither present?  Return the package copy, so a download lands in the
+    self-contained spot."""
+    inside = os.path.join(config.PACKAGE_DIR, LOCAL_TESSDATA_DIRNAME)
+    beside = os.path.join(config.PROJECT_ROOT, LOCAL_TESSDATA_DIRNAME)
+    for folder in (inside, beside):
+        if os.path.isfile(os.path.join(folder, "guj.traineddata")):
+            return folder
+    return inside if os.path.isdir(inside) else beside
 
 
 # Where Tesseract is installed to when this app installs it: on the SAME
@@ -1905,6 +1920,16 @@ def _install_easyocr(line_callback: Callable[[str], None]) -> bool:
                          line_callback) == 0
 
 
+#: (component key, short label) shown in the always-visible setup strip.
+#: Required pieces only - the optional ones would just be amber noise.
+SETUP_STRIP_ITEMS: Tuple[Tuple[str, str], ...] = (
+    ("pip", "Packages"),
+    ("tesseract", "Tesseract"),
+    ("traineddata", "Gujarati data"),
+    ("browser", "Browser"),
+)
+
+
 def setup_components() -> List[SetupComponent]:
     """Everything the Downloads window can check and install."""
     return [
@@ -1961,6 +1986,44 @@ def restart_application() -> None:
         os.execv(sys.executable, [sys.executable] + sys.argv)
     except Exception:
         sys.exit(0)   # at worst, just quit; the user restarts manually
+
+
+def _tooltip(widget: "tk.Misc", text: str) -> None:
+    """Attach (or replace) a hover tooltip.  Plain Tk - no dependency."""
+    state: Dict[str, object] = {"window": None, "text": text}
+    existing = getattr(widget, "_tooltip_state", None)
+    if existing is not None:                  # already wired: just retext it
+        existing["text"] = text
+        return
+    widget._tooltip_state = state             # type: ignore[attr-defined]
+
+    def show(_event=None) -> None:
+        if state["window"] is not None:
+            return
+        try:
+            window = tk.Toplevel(widget)
+            window.wm_overrideredirect(True)
+            window.wm_geometry(
+                f"+{widget.winfo_rootx() + 12}"
+                f"+{widget.winfo_rooty() + widget.winfo_height() + 4}")
+            tk.Label(window, text=str(state["text"]), justify="left",
+                     background="#ffffe1", relief="solid", borderwidth=1,
+                     font=("Segoe UI", 9), padx=6, pady=4).pack()
+            state["window"] = window
+        except tk.TclError:
+            state["window"] = None
+
+    def hide(_event=None) -> None:
+        window = state["window"]
+        state["window"] = None
+        if window is not None:
+            try:
+                window.destroy()
+            except tk.TclError:
+                pass
+
+    widget.bind("<Enter>", show, add="+")
+    widget.bind("<Leave>", hide, add="+")
 
 
 def find_gujarati_ui_font(root: "tk.Tk") -> str:
@@ -6159,6 +6222,26 @@ class Application(ttk.Frame):
         self.newspaper_combo.bind("<<ComboboxSelected>>",
                                   lambda _e: self._on_newspaper_changed())
 
+        # ---- Setup status --------------------------------------------------
+        # Always on screen, never behind a menu: "is the Gujarati data
+        # actually downloaded?" is the first question on a new machine, and
+        # the answer used to be invisible until a run silently found nothing.
+        self._setup_strip = ttk.Frame(self)
+        self._setup_strip.pack(fill="x", padx=8, pady=(0, 2))
+        ttk.Label(self._setup_strip, text="Setup:").pack(side="left")
+        self._setup_labels: Dict[str, ttk.Label] = {}
+        for key, short in SETUP_STRIP_ITEMS:
+            label = ttk.Label(self._setup_strip, text=f"  {short} …",
+                              foreground="#767676", cursor="hand2")
+            label.pack(side="left", padx=(6, 0))
+            label.bind("<Button-1>",
+                       lambda _e: self._open_downloads_dialog())
+            self._setup_labels[key] = label
+        self._setup_fix_btn = ttk.Button(
+            self._setup_strip, text="Downloads & Setup...", width=20,
+            command=self._open_downloads_dialog)
+        self._setup_fix_btn.pack(side="right")
+
         # ---- Progress ------------------------------------------------------
         progress_frame = ttk.Frame(self)
         progress_frame.pack(fill="x", padx=8, pady=(0, 4))
@@ -6237,6 +6320,44 @@ class Application(ttk.Frame):
         # stays empty until there is real progress or an error to show.
         self._update_edition_widgets()
         self._refresh_url()
+        self.refresh_setup_status()
+
+    # -- setup status strip ---------------------------------------------------
+    def refresh_setup_status(self) -> None:
+        """Re-probe what is installed and colour the strip.
+
+        Off the UI thread: probing imports Playwright and hits the disk, and
+        this runs at startup, when the window should already be usable."""
+        def probe() -> None:
+            found = {}
+            for component in setup_components():
+                if component.key not in dict(SETUP_STRIP_ITEMS):
+                    continue
+                try:
+                    found[component.key] = component.probe()
+                except Exception as exc:
+                    found[component.key] = (False, f"check failed ({exc})")
+            self._msg_queue.put(("setup_status", found))
+
+        threading.Thread(target=probe, daemon=True,
+                         name="setup-probe").start()
+
+    def _apply_setup_status(self, found: Dict[str, Tuple[bool, str]]) -> None:
+        missing = 0
+        for key, short in SETUP_STRIP_ITEMS:
+            label = self._setup_labels.get(key)
+            if label is None:
+                continue
+            ready, detail = found.get(key, (False, "unknown"))
+            missing += 0 if ready else 1
+            label.configure(
+                text=f"  {short} {'OK' if ready else 'MISSING'}",
+                foreground="#0a6b0a" if ready else "#c00000")
+            _tooltip(label, f"{short}: {detail}\n\nClick to open "
+                            "Downloads & Setup.")
+        self._setup_fix_btn.configure(
+            text=("Downloads & Setup..." if not missing
+                  else f"Fix {missing} missing..."))
 
     # -- date picker & URL auto-fill -----------------------------------------
     def _on_notice_type(self, choice: str) -> None:
@@ -6714,6 +6835,9 @@ class Application(ttk.Frame):
             self._update_count()
         elif kind == "deps_done":
             self._dependencies_finished(message[1])
+            self.refresh_setup_status()      # an install may have fixed things
+        elif kind == "setup_status":
+            self._apply_setup_status(message[1])
 
     # -- log sidebar ----------------------------------------------------------
     def toggle_log(self) -> None:

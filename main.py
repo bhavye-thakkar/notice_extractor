@@ -61,6 +61,8 @@ def _parse_args(argv):
                         help="stop after N pages per edition (a quick check)")
     parser.add_argument("--save", default="",
                         help="folder to write the cropped notices into")
+    parser.add_argument("--doctor", action="store_true",
+                        help="check this machine and report what is missing")
     return parser.parse_args(argv)
 
 
@@ -167,13 +169,156 @@ def _headless(args) -> int:
     return 1 if summary.skipped and not summary.per_paper else 0
 
 
+def doctor() -> int:
+    """Check this machine and say exactly what is missing, and how to fix it.
+
+    Exists because the failure it diagnoses is invisible: a console window
+    opens, nothing happens, and there is no message to act on."""
+    import importlib.util
+    import shutil
+
+    print(f"Public Notice Extractor - setup check")
+    print(f"  python      {sys.version.split()[0]}  ({sys.executable})")
+    print(f"  project     {config.PROJECT_ROOT}")
+    print(f"  data        {config.DATA_DIR}")
+    print()
+
+    problems: list = []
+
+    def report(name: str, ok: bool, detail: str, fix: str = "") -> None:
+        print(f"  [{'ok ' if ok else 'MISSING'}] {name:<26}{detail}")
+        if not ok and fix:
+            problems.append((name, fix))
+
+    if sys.version_info < (3, 10):
+        report("python 3.10+", False, sys.version.split()[0],
+               "install Python 3.10 or newer")
+    else:
+        report("python 3.10+", True, sys.version.split()[0])
+
+    # Tkinter first: without it there is no window and no way to SHOW an error.
+    try:
+        import tkinter
+        root = tkinter.Tk()
+        root.withdraw()
+        root.destroy()
+        report("tkinter (the window)", True, "can open a window")
+    except Exception as exc:
+        report("tkinter (the window)", False, f"{type(exc).__name__}: {exc}",
+               "reinstall Python with the 'tcl/tk and IDLE' option ticked")
+
+    for module, package in (("numpy", "numpy"), ("cv2", "opencv-python"),
+                            ("PIL", "pillow"), ("pymupdf", "pymupdf"),
+                            ("pytesseract", "pytesseract")):
+        found = importlib.util.find_spec(module) is not None
+        report(package, found, "installed" if found else "not installed",
+               f"pip install {package}")
+
+    playwright = importlib.util.find_spec("playwright") is not None
+    report("playwright", playwright,
+           "installed" if playwright else "not installed (Divya Bhaskar "
+           "needs it)", "pip install playwright && python -m playwright "
+                        "install chromium")
+    if playwright:
+        try:
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as p:
+                exe = p.chromium.executable_path
+            has_browser = os.path.exists(exe)
+        except Exception:
+            has_browser = False
+        report("playwright chromium", has_browser,
+               "downloaded" if has_browser else "browser not downloaded",
+               "python -m playwright install chromium")
+
+    from notice_extractor import core
+    binary = core.TesseractOcrEngine.find_binary() or shutil.which("tesseract")
+    report("tesseract program", bool(binary), binary or "not found",
+           "press 'Download Dependencies' in the app, or install from "
+           "https://github.com/UB-Mannheim/tesseract/wiki")
+
+    model = os.path.join(core.local_tessdata_dir(), "guj.traineddata")
+    has_model = os.path.isfile(model) and os.path.getsize(model) > 100_000
+    report("gujarati OCR model", has_model,
+           model if has_model else f"missing: {model}",
+           "press 'Download Dependencies' in the app (it fetches this), or "
+           f"download guj.traineddata into {core.local_tessdata_dir()}")
+
+    try:
+        from notice_extractor import scrapers
+        loaded = scrapers.load_all()
+        report("newspaper plugins", len(loaded) >= 4,
+               f"{len(loaded)} loaded: {', '.join(loaded)}")
+        for name, problem in scrapers.errors():
+            print(f"        ! {name}: {problem.strip().splitlines()[-1]}")
+    except Exception as exc:
+        report("newspaper plugins", False, f"{type(exc).__name__}: {exc}")
+
+    print()
+    if problems:
+        print(f"{len(problems)} thing(s) to fix:")
+        for name, fix in problems:
+            print(f"  - {name}\n      {fix}")
+        return 1
+    print("Everything needed is present - the app should start.")
+    return 0
+
+
+def _fatal(exc: BaseException) -> int:
+    """Report a startup crash somewhere the user can actually see it.
+
+    A double-clicked script that raises prints its traceback into a console
+    that closes instantly - which looks exactly like 'a blank cmd and then
+    nothing'.  So: print it, try to put it in a dialog too, and hold the
+    console open."""
+    import traceback
+
+    print("\n" + "=" * 60, file=sys.stderr)
+    print("Public Notice Extractor could not start.", file=sys.stderr)
+    print("=" * 60, file=sys.stderr)
+    traceback.print_exception(type(exc), exc, exc.__traceback__)
+    print("\nRun this for a full setup check:", file=sys.stderr)
+    print(f"    \"{sys.executable}\" -m notice_extractor.main --doctor\n",
+          file=sys.stderr)
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror(
+            "Public Notice Extractor could not start",
+            f"{type(exc).__name__}: {exc}\n\n"
+            "Run this in a terminal for a full setup check:\n"
+            f"{sys.executable} -m notice_extractor.main --doctor")
+        root.destroy()
+    except Exception:
+        pass                     # no Tk: the console text is all there is
+    try:
+        if sys.stdin and sys.stdin.isatty():
+            input("Press Enter to close...")
+    except Exception:
+        pass
+    return 2
+
+
 def main(argv=None) -> int:
     args = _parse_args(argv if argv is not None else sys.argv[1:])
-    run_logger.prune()
-    if args.headless:
-        return _headless(args)
-    from notice_extractor.ui.app import run
-    return run()
+    if args.doctor:
+        return doctor()
+    try:
+        run_logger.prune()
+        if args.headless:
+            return _headless(args)
+        # Printed before the window exists, so an empty console always means
+        # "python never got this far" rather than "it started and hung".
+        print("Starting Public Notice Extractor...  "
+              "(run with --doctor to check this machine)", flush=True)
+        from notice_extractor.ui.app import run
+        return run()
+    except KeyboardInterrupt:
+        return 1
+    except BaseException as exc:            # noqa: BLE001 - last line of defence
+        return _fatal(exc)
 
 
 if __name__ == "__main__":

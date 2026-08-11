@@ -1,0 +1,27 @@
+# Public Notice Extractor - Python packages.
+#
+#     pip install -r requirements.txt
+#
+# The app can also install these itself: Downloads > Downloads & Setup...
+# Two things are NOT pip packages and are fetched by that same window:
+#   * the Tesseract OCR program            (installed onto this drive)
+#   * Chromium for Playwright              python -m playwright install chromium
+# The Gujarati OCR model (tessdata/guj.traineddata) ships in this repo.
+
+opencv-python
+numpy
+pillow
+pymupdf
+pytesseract
+playwright
+
+# Windows only: reads the browser's encrypted cookie store for the
+# Divya Bhaskar auto-login, and provides the built-in Windows OCR bindings.
+pycryptodome ; sys_platform == "win32"
+winrt-Windows.Media.Ocr ; sys_platform == "win32" and python_version >= "3.13"
+winrt-Windows.Globalization ; sys_platform == "win32" and python_version >= "3.13"
+winrt-Windows.Graphics.Imaging ; sys_platform == "win32" and python_version >= "3.13"
+winrt-Windows.Storage.Streams ; sys_platform == "win32" and python_version >= "3.13"
+winrt-Windows.Foundation ; sys_platform == "win32" and python_version >= "3.13"
+winrt-Windows.Foundation.Collections ; sys_platform == "win32" and python_version >= "3.13"
+winsdk ; sys_platform == "win32" and python_version < "3.13"
