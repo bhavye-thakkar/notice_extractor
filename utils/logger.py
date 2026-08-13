@@ -26,6 +26,13 @@ _path: str = ""
 #: Writes are buffered and flushed at most this often (see log()).
 FLUSH_EVERY_SECONDS = 0.5
 _last_flush = [0.0]
+#: Set by close(final=True) when the app is quitting.  close() alone only
+#: drops the handle, and the very next log() call reopens it - recreating
+#: data/logs milliseconds after shutdown deleted it.  A browser session or a
+#: cancelled agent winding down is exactly the thread that does that, so the
+#: app's own "nothing is kept" promise was losing a race it did not know it
+#: was in.
+_shut_down = threading.Event()
 
 
 def log_path() -> str:
@@ -42,7 +49,7 @@ def log_path() -> str:
 def log(message: str, level: str = "info") -> None:
     """Append one line.  Never raises - a failed log write must not kill a
     run that is otherwise working."""
-    if not config.LOG_TO_FILE:
+    if not config.LOG_TO_FILE or _shut_down.is_set():
         return
     try:
         stamp = time.strftime("%H:%M:%S")
@@ -80,14 +87,31 @@ def flush() -> None:
                 pass
 
 
-def close() -> None:
+def close(final: bool = False) -> None:
+    """Close the log file.
+
+    `final=True` also stops it being reopened, which is what shutdown needs:
+    log() calls log_path(), and log_path() recreates data/logs on demand, so
+    one late line from a thread still winding down puts the folder straight
+    back after clear_run_data() removed it.
+
+    Only the real quit path passes final=True.  config.clear_run_data() does
+    not - it is also a utility the tests call, and poisoning logging for the
+    rest of the process would be a trap for whatever ran next."""
     global _handle
+    if final:
+        _shut_down.set()
     with _lock:
         if _handle is not None:
             try:
                 _handle.close()
             finally:
                 _handle = None
+
+
+def reopen() -> None:
+    """Undo close(final=True).  For tests that quit an app and keep going."""
+    _shut_down.clear()
 
 
 def prune(days: int = 0) -> int:

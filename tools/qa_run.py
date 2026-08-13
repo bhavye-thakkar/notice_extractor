@@ -131,14 +131,20 @@ def pump_until(root: tk.Tk, predicate, timeout: float) -> bool:
 
 def quiesce(root: tk.Tk, app, report: "Report", why: str,
             timeout: float = 240) -> None:
-    """Get back to an idle window: cancel anything running and wait."""
-    if not app._running:
-        pump(root, 0.3)
-        return
-    app.cancel_btn.invoke()
-    idle = pump_until(root, lambda: not app._running, timeout)
-    report.check("Error Recovery", f"returns to idle {why}", idle,
-                 "cancel + wait" if idle else f"still running after {timeout}s")
+    """Get back to an idle window: cancel anything running and wait.
+
+    "Idle" includes the background crop reader, not just an extraction.
+    Clicking a Notice-type button with notices on screen starts an OCR pass,
+    and measuring a "scroll while idle" baseline on top of that would blame
+    the UI for work the QA itself asked for."""
+    if app._running:
+        app.cancel_btn.invoke()
+        idle = pump_until(root, lambda: not app._running, timeout)
+        report.check("Error Recovery", f"returns to idle {why}", idle,
+                     "cancel + wait" if idle
+                     else f"still running after {timeout}s")
+    if getattr(app, "_searching", False):
+        pump_until(root, lambda: not app._searching, timeout)
     pump(root, 0.5)
 
 
@@ -246,6 +252,21 @@ def qa(args) -> int:
     report.check("UI", "interactive widgets found", len(interactive) >= 15,
                  f"{len(interactive)} widgets")
 
+    # The empty state, while the gallery is genuinely empty - which is only
+    # true HERE.  The button sweep below clicks Extract, and from then on the
+    # gallery has sections.  Checked for readability, not just for existence:
+    # the masonry sizes the canvas from placed cards, so an empty gallery
+    # clamped the window to 20 px and clipped this hint out of sight while
+    # every "is it gridded?" assertion still passed.
+    pump(root, 0.4)
+    hint = app.gallery._empty_label
+    report.check("UI", "empty-gallery hint is readable, not clipped",
+                 bool(hint.winfo_manager())
+                 and app.gallery._inner.winfo_height() >=
+                 hint.winfo_reqheight(),
+                 f"{app.gallery._inner.winfo_height()}px of canvas for a "
+                 f"{hint.winfo_reqheight()}px label")
+
     # -- 2. every button -----------------------------------------------------
     print("\n=== 2. BUTTON-BY-BUTTON ===", flush=True)
     buttons = [w for w in interactive
@@ -343,17 +364,27 @@ def qa(args) -> int:
     # -- 4. search -----------------------------------------------------------
     print("\n=== 4. SEARCH ===", flush=True)
     corpus = ("This is a PUBLIC NOTICE about land. જાહેર નોટિસ મિલકત "
-              "regarding property notice and survey number 42.")
+              "regarding property notice and survey number 42. "
+              "જાહેર ચેતવણી is a public warning about land acquisition.")
     cases = [
         ("public", True), ("notice", True),
         ("public notice", True),                 # the multi-word case
         ("notice public", True),                 # order must not matter
         ("  public   notice  ", True),           # spacing
+        ("public    notice", True),
         ("PUBLIC NOTICE", True),                 # case
-        ("જાહેર", True), ("જાહેર નોટિસ", True),
+        ("Public Notice", True),
+        ("public property notice", True),        # three words
+        ("જાહેર", True), ("નોટિસ", True), ("જાહેર નોટિસ", True),
+        ("ચેતવણી", True), ("જાહેર ચેતવણી", True),
         ("જાહેર property", True),                # mixed scripts
-        ("property notice land", True),          # three words
+        ("property notice", True),
+        ("land notice", True),
+        ("public warning", True),
+        ("land acquisition notice", True),
+        ("property notice land", True),
         ("public tender", False),                # one word absent
+        ("જાહેર હરાજી", False),
         ("zebra", False),
     ]
     for query, expected in cases:
@@ -366,6 +397,143 @@ def qa(args) -> int:
                  search_util.match_query(only_public, "public")
                  and not search_util.match_query(only_public, "public notice"),
                  "single word matches, phrase does not")
+
+    # OCR damage: the search runs on OCR output, which is never clean.
+    for damaged, label in ((" જાહેર   ચેતવણી ", "extra spaces"),
+                           ("જાહેર\nચેતવણી", "split over two lines"),
+                           ("જાહેરચેતવણી", "words run together"),
+                           ("જાહેર ચેતવણિ", "matra dropped by OCR")):
+        report.check("Search", f"'જાહેર ચેતવણી' found with {label}",
+                     search_util.match_query(damaged, "જાહેર ચેતવણી"),
+                     repr(damaged))
+
+    # -- 4b. the notice category ---------------------------------------------
+    print("\n=== 4b. NOTICE CATEGORY (નોટિસ + ચેતવણી) ===", flush=True)
+    for text, expected, label in (
+            ("જાહેર નોટિસ આથી જણાવવામાં આવે છે", True, "જાહેર નોટિસ"),
+            ("જાહેર ચેતવણી આથી જાહેર જનતાને", True, "જાહેર ચેતવણી"),
+            ("જાહેરચેતવણી", True, "ચેતવણી, no space"),
+            ("જાહેર ચેતવણિ", True, "ચેતવણી, matra dropped"),
+            ("PUBLIC NOTICE is hereby given", True, "English notice"),
+            ("JAHER CHETAVNI to all concerned", True, "transliterated"),
+            ("ટેન્ડર નોટિસ", False, "tender (must be vetoed)"),
+            ("જાહેર હરાજી", False, "auction (must be vetoed)")):
+        score, keyword = core.match_notice_text(text, False)
+        hit = score > 0
+        vetoed = core.match_negative_text(text)[0] > 0
+        ok = hit is expected or (not expected and vetoed)
+        report.check("Notice Category", f"classifies {label}", ok,
+                     f"score {score:.2f} {keyword!r}"
+                     + ("  vetoed" if vetoed else ""))
+    report.check("Notice Category",
+                 "both notice types share one category",
+                 set(core.STRICT_KEYWORDS) ==
+                 set(core.JAHER_NOTICE_KEYWORDS) | set(core.CHETAVNI_KEYWORDS),
+                 f"{core.NOTICE_CATEGORY}: "
+                 f"{len(core.STRICT_KEYWORDS)} spellings")
+
+    # -- 4c. the search UI ----------------------------------------------------
+    print("\n=== 4c. SEARCH UI (recent searches) ===", flush=True)
+    gallery = app.gallery
+    saved_history = search_util.load_recent()
+    search_util.clear_recent()
+    gallery.refresh_history()
+    gallery.search_var.set("")
+    pump(root, 0.2)
+
+    report.check("Search UI", "Clear is hidden by default",
+                 not gallery._clear_btn.winfo_manager(),
+                 "no Remove control on an untouched search bar")
+    report.check("Search UI", "no Clear-history row without a history",
+                 list(gallery._search_combo.cget("values")) == [],
+                 "dropdown is empty")
+
+    gallery.search_var.set("public notice")
+    pump(root, 0.2)
+    report.check("Search UI", "Clear appears once there is a query",
+                 bool(gallery._clear_btn.winfo_manager()), "shown on demand")
+
+    ran: List[str] = []
+    real_on_search = gallery.on_search
+
+    def stub_search(query: str) -> None:
+        """Stand in for Application.start_search, INCLUDING the callback.
+
+        The bar refuses a second search while one is in flight, so a stub
+        that only records would wedge it after the first query."""
+        ran.append(query)
+        gallery.search_finished(query, 0, 0)
+
+    gallery.on_search = stub_search
+    try:
+        for query in ("public notice", "જાહેર ચેતવણી", "property notice"):
+            gallery.search_var.set(query)
+            gallery._fire_search()
+            pump(root, 0.15)
+        report.check("Search UI", "every search runs the whole query",
+                     ran == ["public notice", "જાહેર ચેતવણી",
+                             "property notice"], f"{ran}")
+        report.check("Search UI", "recent searches are newest-first",
+                     gallery.recent_searches() ==
+                     ["property notice", "જાહેર ચેતવણી", "public notice"],
+                     f"{gallery.recent_searches()}")
+
+        gallery.search_var.set("PUBLIC   NOTICE")
+        gallery._fire_search()
+        pump(root, 0.15)
+        report.check("Search UI", "history holds no duplicates",
+                     len(gallery.recent_searches()) == 3
+                     and gallery.recent_searches()[0] == "PUBLIC NOTICE",
+                     f"{gallery.recent_searches()}")
+
+        ran.clear()
+        gallery.search_var.set("જાહેર ચેતવણી")
+        gallery._on_history_pick()
+        pump(root, 0.15)
+        report.check("Search UI", "picking a recent search applies it",
+                     ran == ["જાહેર ચેતવણી"], f"{ran} (no retyping)")
+
+        gallery._forget("property notice")
+        pump(root, 0.1)
+        report.check("Search UI", "one entry can be removed",
+                     "property notice" not in gallery.recent_searches()
+                     and len(gallery.recent_searches()) == 2,
+                     f"{gallery.recent_searches()}")
+
+        ran.clear()
+        gallery.search_var.set(gallery.CLEAR_HISTORY_ROW)
+        gallery._on_history_pick()
+        pump(root, 0.15)
+        report.check("Search UI", "Clear-history row clears, never searches",
+                     ran == [] and gallery.recent_searches() == []
+                     and gallery.search_var.get() == "",
+                     "history emptied, search box left clean")
+        report.check("Search UI", "Clear hidden again afterwards",
+                     not gallery._clear_btn.winfo_manager(), "back to default")
+    finally:
+        gallery.on_search = real_on_search
+        search_util.clear_recent()
+        for query in reversed(saved_history):
+            search_util.remember_search(query)
+        gallery.refresh_history()
+        gallery.search_var.set("")
+        pump(root, 0.2)
+
+    # -- 4d. the empty gallery hides its hint once there ARE results ---------
+    print("\n=== 4d. EMPTY STATE (populated) ===", flush=True)
+    pump(root, 0.3)
+    # Section HEADINGS are registered up front, before any notice arrives, so
+    # they are not evidence of anything to show.  The hint must go when there
+    # are notices, and must stay while there are none - eight empty headings
+    # and a blank rectangle is the state this check exists to prevent.
+    if gallery.results:
+        report.check("UI", "empty-gallery hint is gone once notices exist",
+                     not gallery._empty_label.winfo_manager(),
+                     f"{len(gallery.results)} notice(s) on screen")
+    else:
+        report.check("UI", "empty headings still show the hint",
+                     bool(gallery._empty_label.winfo_manager()),
+                     f"{len(gallery.sections)} heading(s), no notices yet")
 
     # -- 5. scrolling BEFORE extraction --------------------------------------
     print("\n=== 5. SCROLLING (before extraction) ===", flush=True)
@@ -492,6 +660,144 @@ def qa(args) -> int:
     report.check("Scrolling", "newest log line reachable",
                  text.yview()[1] > 0.99, "scrolled to bottom")
 
+    # -- 8b. searching the REAL notices this run produced ---------------------
+    print("\n=== 8b. SEARCH OVER THE EXTRACTED NOTICES ===", flush=True)
+    if not app.gallery.all_results():
+        print("  [info] nothing was extracted - nothing to search", flush=True)
+    else:
+        history_before = search_util.load_recent()
+        for query in ("જાહેર", "જાહેર નોટિસ", "જાહેર ચેતવણી"):
+            # A stuck flag makes start_search return early forever, and the
+            # only symptom is that every search below waits out its whole
+            # timeout in silence.  Nine minutes of that is what it cost to
+            # find this once; it is one assertion to never pay it again.
+            report.check("Search", f"idle before searching {query!r}",
+                         not app._searching,
+                         "no background read is stuck from an earlier step")
+            search_started = time.perf_counter()
+            app.gallery.search_var.set(query)
+            app.gallery._fire_search()
+            done = pump_until(root, lambda: not app._searching, timeout=120)
+            elapsed = time.perf_counter() - search_started
+            hits = [r for r in app.gallery.all_results() if r.matched]
+            report.check("Search", f"live search {query!r} completes", done,
+                         f"{len(hits)} of {len(app.gallery.all_results())} "
+                         f"notices in {elapsed:.1f}s")
+            report.metrics[f"search_s_{len(report.metrics)}"] = round(
+                elapsed, 2)
+            # A search narrows the gallery BY ITSELF now - no checkbox to
+            # tick afterwards - so what is on screen must be exactly the
+            # matches, no more and no fewer.
+            pump(root, 0.3)
+            visible = sum(len(app.gallery._visible_results(i))
+                          for i in range(len(app.gallery.sections)))
+            report.check("Search",
+                         f"searching {query!r} shows exactly the matches",
+                         visible == len(hits),
+                         f"{len(hits)} counted, {visible} on screen "
+                         "(no checkbox involved)")
+            report.check("Search",
+                         f"every card on screen matched {query!r}",
+                         all(card.result.matched
+                             for card in app.gallery.cards),
+                         f"{len(app.gallery.cards)} card(s) rendered")
+        report.check("Search UI", "a real search updates the history",
+                     app.gallery.recent_searches()[:1] == ["જાહેર ચેતવણી"],
+                     f"{app.gallery.recent_searches()[:3]}")
+        app.gallery.clear_search()
+        pump(root, 0.2)
+
+        # -- the Notice-type buttons as a LIVE filter ------------------------
+        print("\n=== 8c. NOTICE-TYPE FILTER (live) ===", flush=True)
+        # NOT all_results(): that now includes the Not Sure queue, which is
+        # deliberately absent from the results list.  Comparing the two made
+        # this check fail on a shallow run whose only finds were uncertain -
+        # the app was right and the assertion was stale.
+        everything = len([r for r in app.gallery.all_results()
+                          if not r.needs_review])
+        in_review = len(app.gallery.review_results())
+        report.check("Notice Type Filter", "the Not Sure queue is separate",
+                     in_review == len(app.gallery.all_results()) - everything,
+                     f"{everything} in the results list, {in_review} awaiting "
+                     "review")
+        app.notice_type_var.set(core.NOTICE_TYPE_CHOICES[0])
+        app._on_notice_type(core.NOTICE_TYPE_CHOICES[0])
+        settled = pump_until(root, lambda: not app._searching, timeout=180)
+        pump(root, 0.4)
+        report.check("Notice Type Filter", "classifying the crops finishes",
+                     settled,
+                     f"{sum(1 for r in app.gallery.all_results() if r.notice_type)}"
+                     f" of {everything} notices identified")
+        baseline = len(app.gallery.visible_results())
+        report.check("Notice Type Filter", "'All' shows every notice",
+                     baseline == everything, f"{baseline} of {everything}")
+
+        seen_counts = {}
+        for label in core.NOTICE_TYPE_CHOICES[1:]:
+            app.notice_type_var.set(label)
+            app._on_notice_type(label)
+            pump_until(root, lambda: not app._searching, timeout=180)
+            pump(root, 0.4)
+            shown = app.gallery.visible_results()
+            seen_counts[label] = len(shown)
+            expected = "chetavni" if "ચેતવણ" in label else "notice"
+            wrong = [r for r in shown
+                     if r.notice_type and r.notice_type != expected]
+            report.check("Notice Type Filter",
+                         f"clicking {label!r} filters the gallery",
+                         not wrong and len(shown) <= everything,
+                         f"{len(shown)} of {everything} on screen, "
+                         f"{len(wrong)} of the wrong type"
+                         + ("" if len(shown) < everything
+                            else "  (nothing to remove this run)"))
+            report.check("Notice Type Filter",
+                         f"every card on screen is {label!r} (or unread)",
+                         all(c.result.notice_type in ("", expected)
+                             for c in app.gallery.cards),
+                         f"{len(app.gallery.cards)} card(s) drawn")
+            # "would write 5, not 5" is not evidence of anything.  When a
+            # run happens to hold only one notice type this filter removes
+            # nothing, and a green tick there overstates what was actually
+            # exercised - the same failure as a test that passes while the
+            # user is looking at a blank rectangle.  Say which it was.
+            narrowed = len(shown) < everything
+            report.check("Notice Type Filter",
+                         f"Save All follows the {label!r} filter"
+                         + ("" if narrowed else "  [not exercised]"),
+                         app.gallery.visible_results() == shown
+                         and app.gallery.is_filtered(),
+                         f"would write {len(shown)}, not {everything}"
+                         if narrowed else
+                         f"this run held no other type, so the filter removed "
+                         f"nothing - see test_saving_and_counting_follow_the_"
+                         f"filter for the mixed case")
+
+        app.notice_type_var.set(core.NOTICE_TYPE_CHOICES[0])
+        app._on_notice_type(core.NOTICE_TYPE_CHOICES[0])
+        pump_until(root, lambda: not app._searching, timeout=180)
+        pump(root, 0.4)
+        report.check("Notice Type Filter", "'All' restores the gallery",
+                     len(app.gallery.visible_results()) == everything,
+                     f"back to {everything}")
+        # Every notice belongs to exactly one type, so the two filters must
+        # account for all of them once the unknowns are allowed for.
+        unknown = sum(1 for r in app.gallery.all_results()
+                      if not r.notice_type and not r.needs_review)
+        total_typed = sum(seen_counts.values()) - unknown * len(seen_counts)
+        report.check("Notice Type Filter",
+                     "the two types partition the run",
+                     total_typed == everything - unknown,
+                     f"{seen_counts}, {unknown} unread")
+
+        report.check("Search UI", "Clear resets the search, not the history",
+                     not app.gallery._clear_btn.winfo_manager()
+                     and len(app.gallery.recent_searches()) >= 3,
+                     f"{len(app.gallery.recent_searches())} entries kept")
+        search_util.clear_recent()
+        for query in reversed(history_before):
+            search_util.remember_search(query)
+        app.gallery.refresh_history()
+
     # -- 9. cancellation -----------------------------------------------------
     print("\n=== 9. CANCELLATION ===", flush=True)
     core.PAGE_LIMIT[0] = max(4, args.pages)
@@ -530,9 +836,113 @@ def qa(args) -> int:
     report.check("UI", "window survives resizing", bool(root.winfo_exists()),
                  f"worst stall {beat.worst_ms():.0f} ms")
 
+    # Maximised, then minimised and restored.  A minimised window reports
+    # every child as unmapped, which is exactly the state that desynced the
+    # show/hide logic in the search bar.
+    try:
+        root.state("zoomed")
+        pump(root, 0.6)
+        maximised = root.winfo_width() > 1000
+        root.state("normal")
+        pump(root, 0.4)
+        root.iconify()
+        pump(root, 0.4)
+        root.deiconify()
+        pump(root, 0.6)
+        report.check("UI", "maximise / minimise / restore",
+                     maximised and bool(root.winfo_exists())
+                     and root.state() == "normal",
+                     f"zoomed to {root.winfo_width()}px, restored to "
+                     f"{root.state()}")
+        report.check("UI", "search bar survives minimise/restore",
+                     not app.gallery._clear_btn.winfo_manager(),
+                     "Clear still hidden with an empty query")
+    except tk.TclError as exc:
+        report.check("UI", "maximise / minimise / restore", False, str(exc))
+
     beat.stop()
     dialogs.restore()
-    root.destroy()
+
+    # -- 12. shutdown --------------------------------------------------------
+    # The real quit path, not root.destroy().  It is on DO_NOT_CLICK for the
+    # button sweep (it would end the session mid-QA), so without this the one
+    # code path every single run finishes through was never executed here.
+    print("\n=== 12. SHUTDOWN ===", flush=True)
+    # A real entry, so "the history survived" is not vacuously true on a
+    # machine that happened to have an empty one.
+    search_util.remember_search("QA shutdown probe જાહેર ચેતવણી")
+    history_before = search_util.load_recent()
+    keeper = os.path.join(config.DATA_DIR, "qa-shutdown-keeper.txt")
+    try:
+        with open(keeper, "w", encoding="utf-8") as handle:
+            handle.write("deliberately put here by the QA run\n")
+    except OSError:
+        keeper = ""
+    log_dir = config.LOG_DIR
+    try:
+        app._on_close()
+        raised: Optional[BaseException] = None
+    except Exception as exc:                            # noqa: BLE001
+        raised = exc
+    report.check("Shutdown", "closing the window does not raise",
+                 raised is None,
+                 "app._on_close() ran clean" if raised is None
+                 else repr(raised)[:160])
+    # Asked separately, and outside that try: winfo_exists() RAISES on a
+    # destroyed root rather than returning 0, so asking inside would blame
+    # _on_close() for the very success it is checking for.
+    try:
+        closed = not root.winfo_exists()
+    except tk.TclError:
+        closed = True                  # the interpreter is gone: it closed
+    report.check("Shutdown", "the window actually goes", closed,
+                 "root destroyed")
+    if not closed:
+        try:
+            root.destroy()
+        except tk.TclError:
+            pass
+    # A surviving log folder is not automatically a bug: Windows will not
+    # delete a file another process has open, and a second copy of the app
+    # (or a headless run) legitimately holds its own log.  clear_run_data()
+    # documents that and reports what it managed rather than asserting
+    # success, so this check has to ask WHY the folder is still there
+    # instead of failing the build for someone else's open handle.
+    leftovers = os.listdir(log_dir) if os.path.isdir(log_dir) else []
+    held_by_someone_else = []
+    for name in leftovers:
+        # Try to DELETE it, which is what clear_run_data() was trying to do.
+        # Opening it for append is not the same question: Windows lets a
+        # second process append to a file another one already has open, so
+        # an open() test reported "not locked" for a file the app could not
+        # possibly have removed - and blamed the code for it.
+        try:
+            os.remove(os.path.join(log_dir, name))
+        except OSError:
+            held_by_someone_else.append(name)
+    report.check("Shutdown", "run leftovers are cleared",
+                 not leftovers or len(held_by_someone_else) == len(leftovers),
+                 f"{log_dir}: " + (
+                     "empty" if not leftovers
+                     else f"{len(leftovers)} file(s) left, all still open in "
+                          f"another process - a second copy of the app, or a "
+                          f"headless run ({', '.join(held_by_someone_else)})"
+                     if held_by_someone_else
+                     else f"{len(leftovers)} file(s) the app could have "
+                          f"deleted and did not: {', '.join(leftovers)}"))
+    after = search_util.load_recent()
+    report.check("Shutdown", "recent searches survive the quit",
+                 after == history_before and len(after) >= 1,
+                 f"{len(after)} entry(ies) still saved, newest "
+                 f"{after[0]!r}" if after else "history was wiped")
+    search_util.forget_search("QA shutdown probe જાહેર ચેતવણી")
+    if keeper:
+        report.check("Shutdown", "a file you put in data/ is left alone",
+                     os.path.exists(keeper), os.path.basename(keeper))
+        try:
+            os.remove(keeper)
+        except OSError:
+            pass
 
     # -- 12. performance history --------------------------------------------
     record = {
@@ -563,8 +973,10 @@ def qa(args) -> int:
 
 def print_report(report: Report, record: dict,
                  previous: Optional[dict]) -> None:
-    sections = ["UI", "Buttons", "Search", "Extraction", "Parallel Agents",
-                "Scrolling", "UI Responsiveness", "Error Recovery"]
+    sections = ["UI", "Buttons", "Search", "Search UI", "Notice Category",
+                "Notice Type Filter", "Extraction", "Parallel Agents",
+                "Scrolling", "UI Responsiveness", "Error Recovery",
+                "Shutdown"]
     print("\n" + "=" * 52)
     print("QA REPORT")
     print("=" * 52)
@@ -590,6 +1002,15 @@ def print_report(report: Report, record: dict,
         print(f"  previous run        {before} s")
         print(f"  change              {delta:+.1f}%  "
               f"(notices {previous.get('notices')} -> {record.get('notices')})")
+        # This workload swings 2-3x with whatever else the machine is doing
+        # (decision.md #11), and the UI-stall figure swings WITH it - a 145 s
+        # run and a 40 s run are not the same experiment.  Say so, rather
+        # than leave the next reader to blame the last code change.
+        if before and after / before > 1.5:
+            print(f"  ! this run took {after / before:.1f}x the previous one."
+                  " Something else was using the machine;")
+            print("    re-run on an idle box before reading the stall figure"
+                  " as a regression.")
     print("-" * 52)
     if report.failures:
         print(f"FAILED ({len(report.failures)})")

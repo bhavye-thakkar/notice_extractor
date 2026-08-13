@@ -13,12 +13,19 @@ work - the old code normalised the query to "publicnotice" (normalisation
 strips whitespace) and then looked for that one blob inside single OCR words,
 which no real word ever contains.
 
+The recent-search list lives here too, because "are these two queries the
+same?" is a matching question and the answer has to agree with the search
+itself - "PUBLIC   NOTICE" and "public notice" find the same notices, so the
+history must not hold both.
+
 Self-check:  python -m notice_extractor.utils.search
 """
 
 from __future__ import annotations
 
 import difflib
+import json
+import os
 import re
 from typing import List, Sequence, Tuple
 
@@ -27,6 +34,12 @@ FUZZY_MATCH_RATIO = 0.80
 #: Tokens shorter than this are matched exactly - fuzzy-matching a two-letter
 #: word matches half the page.
 FUZZY_MIN_TOKEN_LEN = 4
+
+#: Recent searches, newest first.  Kept in data/ so it survives a restart -
+#: config.clear_run_data() only removes the transient FOLDERS.
+RECENT_FILENAME = "recent_searches.json"
+#: The dropdown has to stay a glance, not a scroll.
+RECENT_LIMIT = 12
 
 _ZERO_WIDTH_RE = re.compile("[​‌‍﻿]")
 _NON_WORD_RE = re.compile(r"[^\w઀-૿]+", re.UNICODE)
@@ -160,6 +173,82 @@ def search_notice(words: Sequence, full_text: str, query: str,
     return True, boxes
 
 
+# --- recent searches ----------------------------------------------------------
+
+def same_query(a: str, b: str) -> bool:
+    """Are these the same search?  Case- and spacing-insensitive.
+
+    NOT normalize_ocr_text(): that strips whitespace entirely, which would
+    fold "public notice" into "publicnotice" - and those are different
+    searches to the user even though the matcher treats a glued OCR word as
+    a hit for both."""
+    return " ".join((a or "").split()).casefold() == \
+           " ".join((b or "").split()).casefold()
+
+
+def _recent_path() -> str:
+    # Late import: this module is otherwise pure (no paths, no I/O), which is
+    # what lets `python -m notice_extractor.utils.search` self-check run.
+    from .. import config
+    return config.session_file(RECENT_FILENAME)
+
+
+def load_recent() -> List[str]:
+    """The saved searches, newest first.  A missing or corrupt file is an
+    empty history, never an error: nobody should lose a search UI because a
+    convenience file got truncated by a power cut."""
+    try:
+        with open(_recent_path(), encoding="utf-8") as handle:
+            saved = json.load(handle)
+    except (OSError, ValueError):
+        return []
+    if not isinstance(saved, list):
+        return []
+    return [item for item in saved
+            if isinstance(item, str) and item.strip()][:RECENT_LIMIT]
+
+
+def _save_recent(queries: List[str]) -> List[str]:
+    """Write the list, atomically.  A half-written file would read back as
+    corrupt and silently wipe the history."""
+    path = _recent_path()
+    temporary = path + ".tmp"
+    try:
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(queries, handle, ensure_ascii=False, indent=1)
+        os.replace(temporary, path)
+    except OSError:
+        try:
+            os.remove(temporary)
+        except OSError:
+            pass
+    return queries
+
+
+def remember_search(query: str) -> List[str]:
+    """Record a search and return the new history, newest first.
+
+    Searching the same thing again moves it to the top and keeps the NEWEST
+    spelling, rather than adding a second row - a history that fills up with
+    "public notice" three times is not a history."""
+    query = " ".join((query or "").split())
+    if not query:
+        return load_recent()
+    kept = [item for item in load_recent() if not same_query(item, query)]
+    return _save_recent([query] + kept[:RECENT_LIMIT - 1])
+
+
+def forget_search(query: str) -> List[str]:
+    """Drop one entry (the per-item Remove)."""
+    return _save_recent([item for item in load_recent()
+                         if not same_query(item, query)])
+
+
+def clear_recent() -> List[str]:
+    """Drop the whole history (Clear search history)."""
+    return _save_recent([])
+
+
 # --- self-check ---------------------------------------------------------------
 
 class _Word:                      # tiny stand-in for core.OcrWord
@@ -194,6 +283,37 @@ def demo() -> None:
     # A notice whose words OCR glued together still counts as a match.
     glued = [_Word("PUBLICNOTICE")]
     assert search_notice(glued, "PUBLICNOTICE", "public notice")[0]
+
+    # જાહેર ચેતવણી must behave exactly like જાહેર નોટિસ - same category, so
+    # the same search rules, including OCR damage and split lines.
+    warn = "જાહેર ચેતવણી આથી જાહેર જનતાને જણાવવાનું કે"
+    assert match_query(warn, "જાહેર ચેતવણી")
+    assert match_query("જાહેર   ચેતવણી", "જાહેર ચેતવણી")     # extra spaces
+    assert match_query("જાહેર\nચેતવણી", "જાહેર ચેતવણી")      # split over lines
+    assert match_query("જાહેરચેતવણી", "જાહેર ચેતવણી")        # words joined
+    assert not match_query(warn, "જાહેર હરાજી")
+
+    # -- recent searches -------------------------------------------------------
+    # Same query, different spelling: one row, newest form, newest first.
+    assert same_query("public notice", "PUBLIC   Notice")
+    assert not same_query("public notice", "publicnotice")
+
+    kept = clear_recent()
+    assert kept == []
+    remember_search("public notice")
+    remember_search("જાહેર ચેતવણી")
+    assert load_recent() == ["જાહેર ચેતવણી", "public notice"]
+    remember_search("PUBLIC   NOTICE")            # the duplicate case
+    assert load_recent() == ["PUBLIC NOTICE", "જાહેર ચેતવણી"], load_recent()
+    assert forget_search("જાહેર ચેતવણી") == ["PUBLIC NOTICE"]
+    remember_search("   ")                        # empty query saves nothing
+    assert load_recent() == ["PUBLIC NOTICE"]
+    for n in range(RECENT_LIMIT + 5):             # the cap holds
+        remember_search(f"query {n}")
+    assert len(load_recent()) == RECENT_LIMIT
+    assert load_recent()[0] == f"query {RECENT_LIMIT + 4}"
+    clear_recent()
+    assert load_recent() == []
     print("search self-check OK")
 
 

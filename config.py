@@ -102,7 +102,15 @@ TRANSIENT_DIRS: tuple = ("debug", "logs", "cache")
 #: manual step the automation exists to remove.
 PERSISTENT_NAMES: tuple = ("browser_profile", "divyabhaskar_session.txt",
                            "divyabhaskar_autologin.json",
-                           "network_proxy.txt")
+                           "network_proxy.txt",
+                           # Recent searches: a history that empties itself
+                           # every time the app closes is not a history.
+                           "recent_searches.json",
+                           # What the user told us, and what was learned from
+                           # it.  Losing this on exit would mean the app
+                           # forgets every correction the moment it closes.
+                           "feedback.jsonl",
+                           "learned.json")
 
 
 def clear_run_data() -> list:

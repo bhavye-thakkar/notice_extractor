@@ -78,7 +78,7 @@ def _headless(args) -> int:
     missing = core.missing_dependencies()
     if missing:
         print("Missing dependencies: " + ", ".join(missing))
-        print("Install them with:  pip install " + " ".join(missing))
+        print("Install them with: pip install " + " ".join(missing))
         return 2
 
     core.register_newspapers(scrapers.load_all())

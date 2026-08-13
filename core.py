@@ -97,18 +97,19 @@ import urllib.parse
 import http.cookiejar
 from html.parser import HTMLParser
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Tuple, Type
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Type
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 import tkinter.font as tkfont
 
 # --- package modules (no third-party imports, so they are always safe) -------
-from . import config
+from . import __version__, config
 from .ui.app import LOG_PANE_MIN_WIDTH, LOG_PANE_WIDTH, StatusLogPanel
 from .utils import logger as run_logger
 from .utils.search import (FUZZY_MATCH_RATIO, fuzzy_contains,  # noqa: F401
                            normalize_ocr_text, search_notice)
+from .utils import search as search_store
 
 # --- Third-party imports (guarded so we can show a friendly dialog) ----------
 _MISSING_DEPENDENCIES: List[str] = []
@@ -164,7 +165,9 @@ except ImportError:
 # =============================================================================
 
 APP_NAME = "Public Notice Extractor"
-APP_VERSION = "1.36"
+#: One source of truth - notice_extractor/__init__.py.  This was a second
+#: hardcoded copy, and the two had already drifted apart by a version.
+APP_VERSION = __version__
 APP_TITLE = f"{APP_NAME} v{APP_VERSION}"
 
 # Newspaper-dropdown entry that runs every online newspaper in one go.
@@ -311,15 +314,30 @@ def _tesseract_candidates() -> Tuple[str, ...]:
 
 TESSERACT_CANDIDATE_PATHS: Tuple[str, ...] = _tesseract_candidates()
 
-# Notice-header keywords.  The Gujarat Samachar header is "જાહેર નોટિસ" -
-# English "PUBLIC NOTICE" is NOT printed, so strict mode is Gujarati-only.
-# "broad" additionally matches other legal notices (UI checkbox).
+# Notice-header keywords.
+#
+# ONE logical category.  જાહેર નોટિસ and જાહેર ચેતવણી are the same kind of
+# thing to everyone who uses this - a public notice printed in a box - so
+# they share a keyword set, a template pool, a detector, a crop path and a
+# gallery.  NOTICE_CATEGORY names that fact; the two groups below are the
+# spellings it is printed under, not two architectures.  The GUI toggle only
+# narrows what one run looks for.
+NOTICE_CATEGORY = "public_notice"
+#
+# These papers print the Gujarati form; the Latin spellings are carried
+# because the header strips are read with guj+eng and an English or
+# transliterated header must not be a silent miss.  They cost nothing on a
+# Gujarati page - match_notice_text skips a keyword whose script the text
+# does not contain at all.
 JAHER_NOTICE_KEYWORDS: Tuple[str, ...] = (
     "જાહેર નોટિસ", "જાહેર નોટીસ", "જાહેરનોટિસ", "જાહેર નોટીશ",
+    "public notice", "jaher notice", "jaher notis",
 )
-# જાહેર ચેતવણી (public warning) prints as its own boxed notice type.
+# જાહેર ચેતવણી (public warning) prints as its own boxed notice type - same
+# category, different words on the page.
 CHETAVNI_KEYWORDS: Tuple[str, ...] = (
     "જાહેર ચેતવણી", "જાહેરચેતવણી", "જાહેર ચેતવણિ",
+    "public warning", "jaher chetavni", "jaher chetvani",
 )
 STRICT_KEYWORDS: Tuple[str, ...] = JAHER_NOTICE_KEYWORDS + CHETAVNI_KEYWORDS
 
@@ -400,6 +418,12 @@ SWEEP_SINGLE_WORDS: Tuple[Tuple[str, str], ...] = (
 )
 # FUZZY_MATCH_RATIO (tolerance for OCR errors in keywords) is defined with the
 # matcher itself, in utils/search.py, and imported at the top of this file.
+#: An edition no longer than this is almost certainly a supplement (Divya
+#: Bhaskar's Gandhinagar City pull-out is 4 pages every day, against 18-22
+#: for the Ahmedabad main edition).  Used only to explain an empty result,
+#: never to skip anything - a short edition is still read in full.
+SUPPLEMENT_MAX_PAGES = 6
+
 OCR_STRIP_TARGET_HEIGHT = 72      # strips are upscaled to this before OCR
 OCR_MAX_STRIPS_PER_PAGE = 90      # safety cap
 # OCR calls per page that run at the same time ("multiple OCR agents").
@@ -624,6 +648,40 @@ class DetectionConfig:
     strip_frac_of_box: float = 0.32
     strip_max_px: int = 170
     strip_min_px: int = 42
+    #: A SHORTER strip, used only to decide "is there a notice header here?"
+    #: by OCR.  The 0.32 strip above is right for template matching, and far
+    #: too deep for a text test: Gujarati notices close with "આ જાહેર
+    #: નોટીસથી જાહેર જનતાને નોંધ લેવા વિનંતી", so a *continuation column*
+    #: with no header of its own matched on its own body text and was
+    #: cropped as a notice.  Measured over 46 real crops, a genuine header
+    #: sits at 1-3% of the box (median 3%); the false matches were at 25%
+    #: and 27%.  0.18 clears the real ones by 6x and excludes the body.
+    ocr_header_frac: float = 0.18
+    #: A strip scoring in [rescale_probe_low, box_match_threshold) is scored
+    #: again upscaled - see HeaderTemplateVerifier.strip_score().  Small
+    #: headings (a court notice rather than a classified) are ~15 px tall at
+    #: working scale and do not survive the downsample well enough to match.
+    #: The floor keeps the cost off the ~2/3 of candidates that are plainly
+    #: not headings at all.
+    #: Candidates scoring in [review_low, box_match_threshold) are kept as
+    #: NOT SURE rather than dropped.  Today they vanish silently, which is
+    #: where the missed page-15 court notice (0.555) was living.
+    #:
+    #: 0.55 and not 0.45, from the measured score distribution over 273 real
+    #: candidates: the non-notice cluster runs 0.3-0.55 and the real notices
+    #: 0.8-1.0.  Starting at 0.45 would put ~120 plainly-not-notices per
+    #: edition in the review queue and make it useless to work through;
+    #: 0.55 is the top edge of the noise, so what lands there is genuinely
+    #: uncertain - a handful per edition.
+    review_low: float = 0.55
+    rescale_probe_low: float = 0.45
+    rescale_probe_factors: Tuple[float, ...] = (1.8,)
+    #: The probe only has to cover ONE glyph size: a heading that came out
+    #: ~15 px tall at working scale is ~27 px after the 1.8x upscale.
+    #: Sweeping all ten strip_scales again doubled strip scoring for
+    #: nothing (measured: 10.4s -> 21.1s over six pages); these four
+    #: bracket the size the probe exists for.
+    rescale_probe_scales: Tuple[int, ...] = (22, 26, 31, 37)
 
     # Template matching.  Scales start low so lower-resolution pages and
     # small single-column notices still match.
@@ -1329,6 +1387,417 @@ EMBEDDED_HEADER_TEMPLATES_B64: Tuple[Tuple[str, str], ...] = (
      "SqqgwBM5HwTiCF9TEJOASWiAehiqEQgDVIgAEIxRDFCkIIKCiG0qFmLUAUoADCmgACjAf7GD9WoM"
      "YT3BAAUotHCeGd4DIIgQAQQQPBFBoSIAgYDAAKqAGg9SZRYlAqDqhdWTgTfKxqccioIIgBIpAFJ4"
      "jwEEBIZIRQneJJ6hbFmhBKJEAIUC/wMjs1Ohu9ui7wAAAABJRU5ErkJggg=="),
+    # The Ahmedabad City Civil Court prints "જાહેર નોટીસ" (નોટીસ, with ી)
+    # centred in a full-width black bar - a different spelling AND a
+    # different bar style from the classified "જાહેર નોટિસ" above.  Without
+    # this, a real court notice on page 15 scored 0.527 against a 0.66
+    # threshold and was the edition's only missed notice.  Real crop, not a
+    # font render, for the reason given at EMBEDDED_HEADER_TEMPLATES_B64.
+    # "જાહેર નોટિસનો સુધારો" - a CORRECTION to a notice printed earlier,
+    # not a notice.  Gujarat Samachar prints it in the same banner style, so
+    # the positive templates match it (0.76) and it was being extracted.
+    # The existing text override only covers "નોટિસમાં સુધારો"; this one
+    # says "નોટિસનો", and OCR cannot read these white-on-black banners
+    # anyway - so it is vetoed visually, like the Divya Bhaskar pill.
+    ("NEG:gs-sudharo-1",
+     "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"),
+    ("gs-notis-court-1",
+     "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"),
+    ("chetavni-gs-1",
+     "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"
+     "UeF/AwE0BwGzE6kLAAAAAElFTkSuQmCC"),
     ("NEG:db-sudharo-1",
      "iVBORw0KGgoAAAANSUhEUgAAAK4AAAApCAAAAACJ0k1SAAATxUlEQVRYCbXBd3yUVboA4Pc953zf"
      "zGQmhRBMg0ASSmgiC3FYrBS9Sk0oOyiCAiIiYosCd2HVRYoISA9IXxAEaSKCoKBAQgIiIAKhE0pI"
@@ -1548,9 +2017,75 @@ def save_image_unicode(img_bgr: "np.ndarray", path: str) -> None:
 #: the top of this file, so every plugin's `import *` still sees them.
 
 
+def _scripts_in(normalized: str) -> Tuple[bool, bool]:
+    """(has latin, has gujarati) for text that normalize_ocr_text() has
+    already casefolded."""
+    latin = gujarati = False
+    for char in normalized:
+        if "a" <= char <= "z":
+            latin = True
+        elif "઀" <= char <= "૿":
+            gujarati = True
+        if latin and gujarati:
+            break
+    return latin, gujarati
+
+
+@functools.lru_cache(maxsize=512)
+def _keyword_form(keyword: str) -> Tuple[str, bool, bool]:
+    """A keyword's normalised form and scripts, computed once.
+
+    The keyword list is a constant and this used to be re-derived on every
+    single call - `normalize_ocr_text` runs two regex substitutions, and
+    detection asks for these thousands of times per page."""
+    normalized = normalize_ocr_text(keyword)
+    latin, gujarati = _scripts_in(normalized)
+    return normalized, latin, gujarati
+
+
+#: A keyword this short is matched EXACTLY, never fuzzily.  At the 0.84
+#: negative ratio a 4-character word matches on 3 of its 4 characters, and
+#: the fourth is free - which is how "ભરતી" (recruitment) matched inside
+#: "ઘરતીબેન", a woman's name, and vetoed a real City Civil Court notice.
+#: utils.search has carried the same rule for query tokens since it was
+#: written (FUZZY_MIN_TOKEN_LEN); the keyword matchers simply never got it.
+FUZZY_MIN_KEYWORD_LEN = 6
+
+
+def _best_keyword(normalized: str, keywords: Sequence[str],
+                  min_ratio: float) -> Tuple[float, str]:
+    """Best hit of any keyword against already-normalised text.
+
+    Keywords written in a script the text does not contain AT ALL are
+    skipped.  This is not an approximation: `fuzzy_contains` compares
+    characters, so a Latin needle against a haystack holding no Latin scores
+    0 and is discarded by the threshold anyway.  It is what makes carrying
+    the English spellings of the category free on a Gujarati page.
+
+    Short keywords are matched exactly - see FUZZY_MIN_KEYWORD_LEN."""
+    text_latin, text_gujarati = _scripts_in(normalized)
+    best_ratio, best_kw = 0.0, ""
+    for keyword in keywords:
+        needle, kw_latin, kw_gujarati = _keyword_form(keyword)
+        if (kw_latin and not text_latin) or \
+                (kw_gujarati and not text_gujarati):
+            continue
+        if len(needle) < FUZZY_MIN_KEYWORD_LEN:
+            ratio = 1.0 if needle in normalized else 0.0
+        else:
+            ratio = fuzzy_contains(normalized, needle, min_ratio)
+        if ratio > best_ratio:
+            best_ratio, best_kw = ratio, keyword
+    return best_ratio, best_kw
+
+
 def match_notice_text(text: str, broad: bool) -> Tuple[float, str]:
     """Does OCR text contain a notice header?  Returns (confidence 0..1,
-    matched keyword) - (0.0, "") when it does not."""
+    matched keyword) - (0.0, "") when it does not.
+
+    One category, every spelling: જાહેર નોટિસ and જાહેર ચેતવણી are checked
+    by the same call against the same text, so no page is ever read twice to
+    ask about a second notice type."""
     normalized = normalize_ocr_text(text)
     if not normalized:
         return 0.0, ""
@@ -1559,12 +2094,7 @@ def match_notice_text(text: str, broad: bool) -> Tuple[float, str]:
             len(STRICT_KEYWORDS):]
     else:
         keywords = active_strict_keywords()
-    best_ratio, best_kw = 0.0, ""
-    for keyword in keywords:
-        ratio = fuzzy_contains(normalized, normalize_ocr_text(keyword))
-        if ratio > best_ratio:
-            best_ratio, best_kw = ratio, keyword
-    return best_ratio, best_kw
+    return _best_keyword(normalized, keywords, FUZZY_MATCH_RATIO)
 
 
 def match_negative_text(text: str) -> Tuple[float, str]:
@@ -1573,13 +2103,181 @@ def match_negative_text(text: str) -> Tuple[float, str]:
     normalized = normalize_ocr_text(text)
     if not normalized:
         return 0.0, ""
-    best_ratio, best_kw = 0.0, ""
-    for keyword in NEGATIVE_KEYWORDS:
-        ratio = fuzzy_contains(normalized, normalize_ocr_text(keyword),
-                               NEGATIVE_FUZZY_RATIO)
-        if ratio > best_ratio:
-            best_ratio, best_kw = ratio, keyword
-    return best_ratio, best_kw
+    return _best_keyword(normalized, NEGATIVE_KEYWORDS,
+                         NEGATIVE_FUZZY_RATIO)
+
+
+# The word that DISTINGUISHES the two spellings.  "જાહેર" is in both, so it
+# carries no information at all here - the second word is the entire signal.
+# Matching the whole phrase instead is what made 29% of real crops come back
+# "unknown": normalize_ocr_text() strips ALL whitespace, so a notice printed
+# "આથી જાહેર જનતાને નોટીસ" normalises to "...જાહેરજનતાનેનોટીસ..." and the
+# needle "જાહેરનોટીસ" is not inside it - six characters of "જનતાને" sit in
+# the middle.  Right for a phrase search, useless for asking which word is
+# on the page.
+CHETAVNI_MARKERS: Tuple[str, ...] = (
+    "ચેતવણી", "ચેતવણિ", "ચેતવણી", "ચેતવણિ",
+    "chetavni", "chetvani", "warning",
+)
+NOTICE_MARKERS: Tuple[str, ...] = (
+    "નોટિસ", "નોટીસ", "નોટીશ", "નોટિશ", "notice", "notis",
+)
+#: How far down a crop the printed header can be before it stops being the
+#: header.  Notices are boxed with the title on the first line or two; body
+#: text below routinely says "આ નોટીસ પ્રસિદ્ધ થયેથી", which would otherwise
+#: label every ચેતવણી as a નોટિસ.
+HEADER_BAND_FRACTION = 0.30
+
+
+def _marker_score(normalized: str, markers: Tuple[str, ...]) -> float:
+    """Best fuzzy hit of any single marker word in already-normalised text."""
+    best = 0.0
+    for marker in markers:
+        needle, latin, gujarati = _keyword_form(marker)
+        text_latin, text_gujarati = _scripts_in(normalized)
+        if (latin and not text_latin) or (gujarati and not text_gujarati):
+            continue
+        best = max(best, fuzzy_contains(normalized, needle,
+                                        FUZZY_MATCH_RATIO))
+    return best
+
+
+def classify_notice_text(text: str, words: Optional[Sequence] = None,
+                         height: int = 0) -> str:
+    """Which spelling of the category this notice is printed under:
+    "notice", "chetavni", or "" when the crop does not say.
+
+    Read off the CROP, not off the detector.  The detector reaches a notice
+    down five different paths (real template, font template, header OCR,
+    page sweep, split box) and only some of them know which spelling won -
+    threading that through all five would put new state in the most delicate
+    code in the app to answer a question the crop itself answers directly.
+
+    Two rules, both learned from real newsprint:
+
+      * **Look for the distinguishing WORD, not the whole phrase.**  See
+        CHETAVNI_MARKERS above for what phrase matching did to 29% of crops.
+      * **Prefer the header band.**  Given word boxes and a crop height, only
+        the top HEADER_BAND_FRACTION is consulted first, because notice
+        bodies say "નોટીસ" constantly ("આ નોટીસ પ્રસિદ્ધ થયેથી દિન-૭માં")
+        and that would label every ચેતવણી a નોટિસ.  Falls back to the whole
+        crop when the band says nothing - a header OCR missed is better
+        answered late than not at all.
+
+    The full marker set is always checked, whatever the run's toggle says:
+    this labels what a notice IS, and must not change meaning because of what
+    the user happens to be filtering for."""
+
+    def decide(source: str) -> str:
+        normalized = normalize_ocr_text(source)
+        if not normalized:
+            return ""
+        chetavni = _marker_score(normalized, CHETAVNI_MARKERS)
+        notice = _marker_score(normalized, NOTICE_MARKERS)
+        if not chetavni and not notice:
+            return ""
+        # Ties go to ચેતવણી: it is the rarer, more specific word, and a crop
+        # containing it is a ચેતવણી even when the body also says "નોટીસ".
+        return "chetavni" if chetavni >= notice else "notice"
+
+    if words and height > 0:
+        cutoff = height * HEADER_BAND_FRACTION
+        band = " ".join(getattr(w, "text", "") for w in words
+                        if getattr(w, "y", 0) <= cutoff)
+        verdict = decide(band)
+        if verdict:
+            return verdict
+    return decide(text)
+
+
+def family_of_keyword(keyword: str) -> str:
+    """Which notice type a matched keyword belongs to."""
+    if not keyword:
+        return ""
+    return "chetavni" if keyword in CHETAVNI_KEYWORDS else "notice"
+
+
+def _classify_result(result: "NoticeResult") -> str:
+    """classify_notice_text() for a NoticeResult - passes the word boxes and
+    the crop height so the header band can be preferred over the body."""
+    try:
+        height = int(result.image_bgr.shape[0])
+    except Exception:
+        height = 0
+    return classify_notice_text(result.ocr_text, result.ocr_words, height)
+
+
+def read_notice_crops(results: Sequence["NoticeResult"], engine,
+                      log: Optional[Callable[[str], None]] = None) -> int:
+    """OCR every crop that has not been read yet, and label its type.
+
+    Detection only ever reads a header STRIP, so the crops arrive unread;
+    this is the one place that reads them end to end, and both Find-text and
+    the notice-type filter need exactly the same pass.  Returns how many were
+    read.  Runs on a worker thread - the caller owns that."""
+    pending = [r for r in results if not r.ocr_done]
+    if engine is None or not pending:
+        # No engine: still label from whatever text is already there, so a
+        # re-run does not re-decide.
+        for result in results:
+            if not result.notice_type:
+                result.notice_type = _classify_result(result)
+        return 0
+    if log is not None:
+        log(f"reading {len(pending)} notice(s) with {engine.name}...")
+
+    def read(result: "NoticeResult") -> None:
+        try:
+            gray = cv2.cvtColor(result.image_bgr, cv2.COLOR_BGR2GRAY)
+            result.ocr_words = engine.read_words(gray)
+            result.ocr_text = " ".join(w.text for w in result.ocr_words)
+        except Exception:
+            result.ocr_words = []
+            result.ocr_text = ""
+        finally:
+            result.ocr_done = True
+            # Only when detection did not already know.  It read the header
+            # off an upscaled strip; this read the whole crop with psm 11,
+            # which drops the display-type title line - so overwriting here
+            # threw away the better answer for the worse one, and left 13 of
+            # 59 real notices unclassifiable that detection had identified.
+            if not result.notice_type:
+                result.notice_type = _classify_result(result)
+            result.normalized_ocr = normalize_ocr_text(result.ocr_text)
+
+    list(get_ocr_pool().map(read, pending))
+    for result in results:
+        if not result.notice_type:
+            result.notice_type = _classify_result(result)
+        if not result.normalized_ocr:
+            result.normalized_ocr = normalize_ocr_text(result.ocr_text)
+    apply_learning(results)
+    return len(pending)
+
+
+def apply_learning(results: Sequence["NoticeResult"]) -> int:
+    """Hide notices the learned model has seen the user reject before.
+
+    Runs HERE, in the one place that reads crops, so learning costs no extra
+    OCR: the text it needs is the text Find-text and the notice-type filter
+    were already going to produce.
+
+    Only ever sets `demoted`.  It never touches `rejected` (a human's
+    verdict) and never deletes anything - a demoted notice is one click away
+    under "Show hidden", and the gallery says how many it hid.  The two hard
+    limits on what it may touch at all are in feedback.should_demote()."""
+    from .utils import feedback as feedback_store
+
+    model = feedback_store.load_model()
+    if not model.get("weights"):
+        return 0
+    hidden = 0
+    for result in results:
+        if result.rejected:
+            continue
+        result.demoted = feedback_store.should_demote(result, model)
+        hidden += 1 if result.demoted else 0
+    return hidden
 
 
 def human_bytes(n: int) -> str:
@@ -2026,19 +2724,34 @@ def _tooltip(widget: "tk.Misc", text: str) -> None:
     widget.bind("<Leave>", hide, add="+")
 
 
+_GUJARATI_UI_FONT: List[str] = []
+
+
 def find_gujarati_ui_font(root: "tk.Tk") -> str:
     """Pick an installed font family that renders Gujarati in Tk widgets
     (native message boxes cannot be font-controlled, so custom dialogs use
-    this)."""
+    this).
+
+    Answered once per process.  `tkfont.families()` is a Tcl round-trip that
+    enumerates every installed family - hundreds of strings - and the answer
+    cannot change while the app is running.  It is now on the per-card path
+    (the "Matched:" line), so a 40-card page would otherwise enumerate the
+    machine's fonts 40 times to reach the same string."""
+    if _GUJARATI_UI_FONT:
+        return _GUJARATI_UI_FONT[0]
     try:
         families = {f.lower() for f in tkfont.families(root)}
     except Exception:
         families = set()
+    chosen = "Segoe UI" if sys.platform.startswith("win") else "TkDefaultFont"
     for name in ("Nirmala UI", "Shruti", "Arial Unicode MS",
                  "Noto Sans Gujarati", "Lohit Gujarati"):
         if name.lower() in families:
-            return name
-    return "Segoe UI" if sys.platform.startswith("win") else "TkDefaultFont"
+            chosen = name
+            break
+    if families:            # don't cache the fallback from a failed lookup
+        _GUJARATI_UI_FONT.append(chosen)
+    return chosen
 
 
 # =============================================================================
@@ -2068,8 +2781,35 @@ class NoticeResult:
     ocr_text: str = ""
     #: True once the OCR above has been attempted, successfully or not.
     ocr_done: bool = False
+    #: Which spelling of the category this is - "notice" | "chetavni" | ""
+    #: (unknown, i.e. OCR could not read the header).  Filled in by
+    #: read_notice_crops(); drives the Notice-type filter on the gallery.
+    notice_type: str = ""
     #: Word boxes matching the CURRENT search, in crop pixel coordinates.
     match_boxes: List[Tuple[int, int, int, int]] = field(default_factory=list)
+    #: Did this notice match the current search?  Separate from match_boxes
+    #: on purpose: a notice CAN match with no boxes at all - OCR glues the
+    #: phrase into one word whose pieces no longer line up with the query -
+    #: and search.search_notice() returns exactly that pair.  The gallery
+    #: used to read the verdict off `match_boxes`, so those notices were
+    #: counted in "3 of 40 contain X" and then hidden by "Show only matches".
+    matched: bool = False
+    #: The query this notice matched, shown on the card ("Matched: ...").
+    match_query_text: str = ""
+    #: ocr_text with whitespace and punctuation collapsed - what the learned
+    #: model scores against.  Cached here rather than recomputed, because
+    #: the learning pass touches every result on every gallery refresh.
+    normalized_ocr: str = ""
+    #: True once the user pressed "Not Related" on this one, or the learned
+    #: model demoted it.  Kept on the result rather than deleted from the
+    #: gallery so Undo is possible and the count can explain itself.
+    rejected: bool = False
+    #: Set when the LEARNED model hid it (not a human click) - the two are
+    #: reported separately, because one is a fact and the other is a guess.
+    demoted: bool = False
+    #: True while this notice is in the Not Sure queue rather than the
+    #: results list - see GalleryPanel.review_results().
+    needs_review: bool = False
 
     @property
     def suggested_filename(self) -> str:
@@ -3031,6 +3771,16 @@ class Detection:
     rect: Tuple[int, int, int, int]
     score: float
     method: str
+    #: "notice" | "chetavni" | "" - which spelling the HEADER was printed
+    #: under, taken from whichever template or keyword actually matched it.
+    #: Recorded here because this is the only place that knows: detection
+    #: reads the header from an upscaled strip, and re-reading it later off
+    #: the whole crop loses the display-type title line.
+    family: str = ""
+    #: True when the header scored in the uncertain band (see
+    #: DetectionConfig.review_low): kept, but sent to the Not Sure queue
+    #: instead of the results, for the user to confirm or reject.
+    uncertain: bool = False
 
 
 #: RAQM is a process-wide property of Pillow; warn about it once, not once
@@ -3059,22 +3809,18 @@ def _font_renders_gujarati(font_path: str) -> bool:
 
 
 @functools.lru_cache(maxsize=4)
-def discover_gujarati_fonts(max_fonts: int = 2) -> List[str]:
-    """Find fonts able to render Gujarati.  Known good names are tried first;
-    if none of them exist (or fail the glyph test) the system font folders
-    are scanned and every font is glyph-tested until enough are found.
-
-    Cached: the walk glyph-tests up to 900 font files and the installed fonts
-    do not change mid-run, but every edition agent builds a verifier."""
+@functools.lru_cache(maxsize=8)
+def _discover_gujarati_fonts(max_fonts: int) -> Tuple[str, ...]:
+    """The uncached walk - see discover_gujarati_fonts() below."""
     found: List[str] = []
 
     for candidate in GUJARATI_FONT_CANDIDATES:
         if len(found) >= max_fonts:
-            return found
+            return tuple(found)
         if os.path.isfile(candidate) and _font_renders_gujarati(candidate):
             found.append(candidate)
     if found:
-        return found
+        return tuple(found)
 
     font_dirs = [
         r"C:\Windows\Fonts",
@@ -3097,13 +3843,33 @@ def discover_gujarati_fonts(max_fonts: int = 2) -> List[str]:
                     continue
                 tested += 1
                 if tested > 900:          # bound startup cost
-                    return found
+                    return tuple(found)
                 path = os.path.join(root, name)
                 if _font_renders_gujarati(path):
                     found.append(path)
                     if len(found) >= max_fonts:
-                        return found
-    return found
+                        return tuple(found)
+    return tuple(found)
+
+
+def discover_gujarati_fonts(max_fonts: int = 2) -> List[str]:
+    """Find fonts able to render Gujarati.  Known good names are tried first;
+    if none of them exist (or fail the glyph test) the system font folders
+    are scanned and every font is glyph-tested until enough are found.
+
+    ACTUALLY cached now.  The docstring has always claimed to be, and it
+    never was: every HeaderTemplateVerifier called it, and one of those is
+    built per page-worker thread (see decision.md #6), so a run built it two
+    dozen times.  On the happy path that is two TrueType loads and four
+    glyph rasterisations each - all pure Python holding the GIL, which is
+    what lands on the UI thread as a stall.  On a machine with none of the
+    named fonts it re-walked and glyph-tested up to 900 font files EVERY
+    time.  Installed fonts do not change mid-run.
+
+    A list is returned (callers extend and slice it) from a tuple that is
+    what actually gets cached - handing out the cached list itself would let
+    one caller's `.extend()` corrupt everybody else's answer."""
+    return list(_discover_gujarati_fonts(max_fonts))
 
 
 class HeaderTemplateVerifier:
@@ -3122,6 +3888,9 @@ class HeaderTemplateVerifier:
         # Lets each newspaper pipeline use its own real-paper samples.
         self._embedded_prefixes = embedded_prefixes
         self.templates: List[Tuple[str, "np.ndarray"]] = []
+        #: The real newsprint crops only (no font renders) - what the
+        #: upscale probe in strip_score() re-scores with.
+        self._real_templates: List[Tuple[str, "np.ndarray"]] = []
         self.font_positive_templates: List[Tuple[str, "np.ndarray"]] = []
         self.negative_templates: List[Tuple[str, "np.ndarray"]] = []
         self.strong_negative_templates: \
@@ -3137,14 +3906,25 @@ class HeaderTemplateVerifier:
 
     # -- template construction ------------------------------------------------
     @staticmethod
-    def _find_fonts(candidates: Tuple[str, ...],
-                    globs: Tuple[str, ...] = ()) -> List[str]:
+    @functools.lru_cache(maxsize=16)
+    def _find_fonts_cached(candidates: Tuple[str, ...],
+                           globs: Tuple[str, ...]) -> Tuple[str, ...]:
+        """Cached for the same reason discover_gujarati_fonts() is: this runs
+        once per page-worker pipeline, and a recursive glob over
+        /usr/share/fonts is a filesystem walk holding the GIL."""
         found = [p for p in candidates if os.path.isfile(p)]
         for pattern in globs:
             for p in sorted(glob.glob(pattern, recursive=True)):
                 if p not in found:
                     found.append(p)
-        return found
+        return tuple(found)
+
+    @classmethod
+    def _find_fonts(cls, candidates: Tuple[str, ...],
+                    globs: Tuple[str, ...] = ()) -> List[str]:
+        # A fresh list per caller: the cache must not hand out something a
+        # caller can mutate.
+        return list(cls._find_fonts_cached(tuple(candidates), tuple(globs)))
 
     def _render_text(self, text: str, font_path: str) -> Optional["np.ndarray"]:
         """Render black text on white; return a tightly-cropped gray array."""
@@ -3210,6 +3990,10 @@ class HeaderTemplateVerifier:
             except Exception:
                 continue
         self.have_embedded = bool(self.templates)
+        # Everything loaded so far is a real newsprint crop; the font
+        # renders appended below are a different quality of evidence.  The
+        # upscale probe in strip_score() uses only these.
+        self._real_templates = list(self.templates)
 
         # 2) Font-rendered templates as extra variants.
         guj_fonts = discover_gujarati_fonts(max_fonts=2)
@@ -3360,13 +4144,64 @@ class HeaderTemplateVerifier:
         return best
 
     def strip_score(self, strip: "np.ndarray") -> float:
-        """Best template score for one candidate header strip."""
+        """Best template score for one candidate header strip.
+
+        Also records WHICH template won, in `last_strip_family` - the notice
+        type this header is printed under.  Recorded, never used to decide:
+        the returned score is unchanged, so no detection moves.  It is kept
+        because this is the one place that knows, and the crop cannot be
+        asked later: the header is display type, and reading a whole crop
+        with psm 11 drops the big isolated title line (measured - 11 of 13
+        unclassifiable crops had a perfectly legible header the crop OCR
+        simply did not return)."""
+        self.last_strip_family = ""
         if strip.size == 0 or not self.templates:
             return 0.0
+        best = self._score_at(strip)
+
+        # Second look, for small headings only.  A page is detected at
+        # working_width (1500 px for a 2800 px page), and a heading printed
+        # small - a court notice rather than a classified - comes out about
+        # 15 px tall there, where the glyphs no longer survive the
+        # downsample well enough to correlate.  Re-scoring the strip
+        # upscaled recovers those.
+        #
+        # Gated on the first score for cost: only strips already in the
+        # "looks like something" band pay for it, which measured as 4 of 272
+        # candidates on a real 18-page edition - and those 4 were the
+        # edition's genuinely missed notices, not a lift of the whole
+        # non-notice cluster (198 candidates under 0.60, 4 of which moved).
+        cfg = self._cfg
+        if cfg.rescale_probe_low <= best < cfg.box_match_threshold:
+            family = self.last_strip_family
+            for factor in cfg.rescale_probe_factors:
+                bigger = cv2.resize(strip, None, fx=factor, fy=factor,
+                                    interpolation=cv2.INTER_CUBIC)
+                # Real newsprint crops only.  The probe exists to rescue a
+                # heading the downsample blurred, and only a real crop of
+                # the same press can score one that high anyway - a font
+                # render never clears the threshold.  Probing with the whole
+                # template list instead doubled a full edition (191s -> 378s)
+                # to find the same notices.
+                score = self._score_at(bigger, self._real_templates,
+                                       cfg.rescale_probe_scales)
+                if score > best:
+                    best, family = score, self.last_strip_family
+            self.last_strip_family = family
+        return best
+
+    def _score_at(self, strip: "np.ndarray",
+                  templates: Optional[List[Tuple[str, "np.ndarray"]]] = None,
+                  scales: Optional[Tuple[int, ...]] = None) -> float:
+        """Best template score for a strip exactly as given."""
         best = 0.0
-        for _, template in self.templates:
-            best = max(best, self._match_one(strip, template,
-                                             self._cfg.strip_scales))
+        heights = self._cfg.strip_scales if scales is None else scales
+        for label, template in (self.templates if templates is None
+                                else templates):
+            score = self._match_one(strip, template, heights)
+            if score > best:
+                best = score
+                self.last_strip_family = self._family_of(label)
         return best
 
     def negative_strip_score(self, strip: "np.ndarray") -> float:
@@ -3427,6 +4262,8 @@ class HeaderTemplateVerifier:
         #: the page holds anything header-shaped at all - see
         #: OCR_SWEEP_MIN_TEMPLATE.
         self.last_scan_best = 0.0
+        #: Notice type of the template that won the last strip_score() call.
+        self.last_strip_family = ""
         if not self.templates:
             return hits
         for _, template in self.scan_templates:
@@ -3778,21 +4615,52 @@ class NoticeDetectionPipeline:
             score = self.verifier.strip_score(strip)
             self.last_candidate_scores.append(round(float(score), 3))
             if score >= cfg.box_match_threshold:
-                detections.append(Detection(rect, score, "box+template"))
+                detections.append(Detection(rect, score, "box+template",
+                                            self.verifier.last_strip_family))
                 continue
             if self._ocr is not None and \
                     len(undecided) < OCR_MAX_STRIPS_PER_PAGE and \
                     self._strip_has_ink(strip):
-                undecided.append((rect, strip, score))
+                # The SHALLOW band for the text test - a header lives in the
+                # first few percent of a box, and reading a third of the way
+                # down accepts a continuation column on its own closing
+                # sentence.  Smaller image, so this is also cheaper to OCR.
+                undecided.append(
+                    (rect, self._header_strip(gray, rect,
+                                              cfg.ocr_header_frac), score))
+            elif score >= cfg.review_low:
+                detections.append(Detection(
+                    rect, score, "box+template?",
+                    self.verifier.last_strip_family, uncertain=True))
 
         if undecided:
             texts = self._ocr_batch([strip for _r, strip, _s in undecided])
             for (rect, _strip, score), text in zip(undecided, texts):
-                ratio, _kw = match_notice_text(text, self._broad)
+                ratio, keyword = match_notice_text(text, self._broad)
                 if ratio > 0:
                     combined = max(score, 0.50 + 0.45 * ratio)
+                    # The keyword that matched IS the notice type, and this
+                    # is the upscaled header strip - the most reliable read
+                    # of the title anywhere in the pipeline.  It used to be
+                    # discarded as `_kw`.
                     detections.append(Detection(rect, min(combined, 0.97),
-                                                "box+ocr"))
+                                                "box+ocr",
+                                                family_of_keyword(keyword)))
+                elif score >= cfg.review_low:
+                    # Template says "maybe", OCR could not confirm it.  Too
+                    # weak for the results, too close to throw away - so it
+                    # goes to the Not Sure queue for the user to settle, and
+                    # the answer becomes training evidence.  Dropping these
+                    # silently is how a real court notice went missing.
+                    #
+                    # AFTER the OCR attempt, never instead of it: an earlier
+                    # version short-circuited here and sent the English
+                    # PUBLIC NOTICE - which OCR confirms at ratio 1.00 - to
+                    # review instead of the results.  Review is the last
+                    # resort, not a shortcut past the safety net.
+                    detections.append(Detection(
+                        rect, score, "box+template?",
+                        self.verifier.last_strip_family, uncertain=True))
 
         # --- Pass 2: full-page template sweep (broken borders) --------------
         hits = self.verifier.page_scan(gray, cfg.page_match_threshold)
@@ -4027,7 +4895,8 @@ class NoticeDetectionPipeline:
                 if cw >= 70:
                     cells.append(Detection(
                         (x_bounds[i], cy0, cw, cy1 - cy0),
-                        det.score, det.method + "+split"))
+                        det.score, det.method + "+split", det.family,
+                        det.uncertain))
         if len(cells) < 2:
             return [det]
         # Sanity: every cell must have its own header in its TOP part -
@@ -4207,10 +5076,17 @@ class NoticeDetectionPipeline:
 
     # -- helpers --------------------------------------------------------------
     def _header_strip(self, gray: "np.ndarray",
-                      rect: Tuple[int, int, int, int]) -> "np.ndarray":
+                      rect: Tuple[int, int, int, int],
+                      frac: Optional[float] = None) -> "np.ndarray":
+        """The top band of a box, where a header would be.
+
+        `frac` overrides how much of the box to take - see
+        DetectionConfig.ocr_header_frac for why the OCR test wants a
+        shallower band than template matching does."""
         cfg = self._cfg
         x, y, w, h = rect
-        strip_h = int(clamp(h * cfg.strip_frac_of_box,
+        strip_h = int(clamp(h * (cfg.strip_frac_of_box if frac is None
+                                 else frac),
                             cfg.strip_min_px, cfg.strip_max_px))
         inset = 4  # keep the border line itself out of the strip
         y0 = clamp(y + 2, 0, gray.shape[0] - 1)
@@ -4255,17 +5131,6 @@ class NoticeDetectionPipeline:
 # --- Per-newspaper pipelines -------------------------------------------------
 # Each newspaper gets its own pipeline class with its own templates and
 # thresholds, so tuning one paper never affects another.
-
-
-
-
-
-
-
-
-
-
-
 # =============================================================================
 # 8. EXTRACTORS (BASE CLASS, GUJARAT SAMACHAR, SANDESH, DIVYA BHASKAR)
 # =============================================================================
@@ -4573,6 +5438,10 @@ class BaseNewspaperExtractor:
                                 confidence=int(clamp(round(det.score * 100),
                                                      1, 99)),
                                 method=det.method,
+                                # What the header actually said, captured
+                                # where it was legible (an upscaled strip).
+                                notice_type=det.family,
+                                needs_review=det.uncertain,
                                 edition=label,
                                 newspaper=self.display_name,
                                 issue_date=getattr(self, "current_issue_date",
@@ -4588,6 +5457,24 @@ class BaseNewspaperExtractor:
                 if failed_pages:
                     note += f" (page errors: {failed_pages})"
                 edition_notes.append(note)
+
+                # An edition that finds nothing is the one result a user
+                # cannot tell apart from a broken one, so it says how much
+                # paper it actually read.  A short edition is usually a
+                # supplement - Divya Bhaskar's Gandhinagar is a 4-page City
+                # pull-out every day, against 18-22 pages for Ahmedabad, and
+                # it carries no public notices at all.  "0" alone reads as a
+                # failure; "0 across 4 pages (a supplement, not the main
+                # edition)" reads as an answer.
+                if found_here == 0 and total:
+                    tail = (" - a supplement rather than the main edition, "
+                            "which is where the notices are printed"
+                            if total <= SUPPLEMENT_MAX_PAGES else "")
+                    reporter.log(
+                        f"  No Public Notices in this edition "
+                        f"({total} page"
+                        f"{'s' if total != 1 else ''} read){tail}.",
+                        "warn" if not tail else "dim")
 
             if finalize:
                 reporter.separator()
@@ -4891,8 +5778,11 @@ class NoticeCard(ttk.Frame):
     def __init__(self, master, result: NoticeResult,
                  on_open: Callable[[NoticeResult], None],
                  on_save: Callable[[NoticeResult], None],
-                 on_click: Callable[[NoticeResult], None]):
-        matched = bool(result.match_boxes)
+                 on_click: Callable[[NoticeResult], None],
+                 on_copy: Optional[Callable[[NoticeResult], None]] = None,
+                 on_feedback: Optional[
+                     Callable[[NoticeResult, str], None]] = None):
+        matched = bool(result.matched)
         super().__init__(master, relief="solid" if matched else "groove",
                          borderwidth=3 if matched else 2, padding=6,
                          style="Match.TFrame" if matched else "TFrame")
@@ -4930,14 +5820,46 @@ class NoticeCard(ttk.Frame):
         meta = ttk.Label(self, text=result.caption, foreground="#555555")
         meta.grid(row=2, column=0, columnspan=3, sticky="w")
 
+        row = 3
+        if matched and result.match_query_text:
+            # WHY this card is on screen.  The wash on the thumbnail shows
+            # where the words are; this says what was looked for - and it is
+            # the only signal at all for a notice that matched with no boxes.
+            hit = ttk.Label(
+                self, text=f"Matched:  {result.match_query_text}",
+                foreground="#1d4ed8", font=(find_gujarati_ui_font(
+                    master.winfo_toplevel()), 9, "bold"))
+            hit.grid(row=row, column=0, columnspan=3, sticky="w", pady=(3, 0))
+            row += 1
+
         check = ttk.Checkbutton(self, text="Select", variable=self.selected)
-        check.grid(row=3, column=0, sticky="w", pady=(4, 0))
-        ttk.Button(self, text="Open", width=6,
-                   command=lambda: on_open(result)
-                   ).grid(row=3, column=1, sticky="e", pady=(4, 0), padx=2)
-        ttk.Button(self, text="Save", width=6,
-                   command=lambda: on_save(result)
-                   ).grid(row=3, column=2, sticky="e", pady=(4, 0))
+        check.grid(row=row, column=0, sticky="w", pady=(4, 0))
+        actions = ttk.Frame(self)
+        actions.grid(row=row, column=1, columnspan=2, sticky="e", pady=(4, 0))
+        ttk.Button(actions, text="Open", width=6,
+                   command=lambda: on_open(result)).pack(side="left", padx=2)
+        ttk.Button(actions, text="Save", width=6,
+                   command=lambda: on_save(result)).pack(side="left", padx=2)
+        ttk.Button(actions, text="Copy", width=6,
+                   command=lambda: on_copy(result)).pack(side="left")
+        row += 1
+
+        # -- feedback ---------------------------------------------------------
+        # ONE button here, deliberately.  This notice is in the results
+        # because the app already believes it belongs; the only thing left
+        # worth asking is whether it got that wrong.  "This Is Right" lives
+        # in the Not Sure queue, where the app genuinely does not know - see
+        # ReviewDialog.  Offering both everywhere would make the common case
+        # (the app was right, say nothing) into a decision on every card.
+        if on_feedback is not None:
+            bar = ttk.Frame(self)
+            bar.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+            ttk.Label(bar, text="Is this relevant?",
+                      foreground="#767676").pack(side="left")
+            ttk.Button(bar, text="✕ Not Related", width=15,
+                       style="Reject.TButton",
+                       command=lambda: on_feedback(result, "negative")).pack(
+                side="right")
 
 
 class GalleryPanel(ttk.LabelFrame):
@@ -4950,11 +5872,17 @@ class GalleryPanel(ttk.LabelFrame):
     every screen far below Tk's canvas addressing limit.
     """
 
-    def __init__(self, master, on_open, on_save, on_click):
+    def __init__(self, master, on_open, on_save, on_click,
+                 on_copy=None, on_feedback=None):
         super().__init__(master, text="Detected Public Notices")
         self._on_open = on_open
         self._on_save = on_save
         self._on_click = on_click
+        self._on_copy = on_copy
+        self._on_feedback = on_feedback
+        #: While true the gallery also shows what the learned model demoted,
+        #: so a hidden notice is always one click from being visible again.
+        self.show_hidden = False
         #: [{"title": str, "results": [NoticeResult]}]
         self.sections: List[Dict[str, object]] = []
         #: EVERY notice from the whole run
@@ -4975,6 +5903,10 @@ class GalleryPanel(ttk.LabelFrame):
         self._last_width = 0
         self.on_show_more: Optional[Callable[[], None]] = None   # legacy
         self.on_page_change: Optional[Callable[[], None]] = None
+        #: Set by the Application - called whenever a filter changes what is
+        #: on screen, so the preview cannot keep showing a notice the filter
+        #: has just hidden.
+        self.on_filter_change: Optional[Callable[[], None]] = None
 
         # ---- navigation bar -------------------------------------------------
         nav = ttk.Frame(self)
@@ -4995,9 +5927,11 @@ class GalleryPanel(ttk.LabelFrame):
         # Search state.  The widgets live in the TOP control bar (under the
         # dates) - the Application calls build_search_bar() to put them there.
         self.search_var = tk.StringVar()
-        self._search_only = tk.BooleanVar(value=False)
         self._search_btn: Optional[ttk.Button] = None
         self._search_label: Optional[ttk.Label] = None
+        self._search_combo: Optional[ttk.Combobox] = None
+        self._clear_btn: Optional[ttk.Button] = None
+        self._history_menu: Optional[tk.Menu] = None
         #: set by the Application - runs the OCR + matching off the UI thread
         self.on_search: Optional[Callable[[str], None]] = None
 
@@ -5025,6 +5959,17 @@ class GalleryPanel(ttk.LabelFrame):
 
     # -- public API -----------------------------------------------------------
     def clear(self) -> None:
+        # A new run means new notices, so any live search must go: every
+        # result of the new run has matched=False, and a leftover query
+        # would hide the whole run behind "no match for ...".  This also
+        # un-sticks the Search button when a search was orphaned by the run
+        # starting - it was disabled awaiting a reply that can no longer
+        # arrive (see Application._begin_run).
+        self.search_var.set("")
+        if self._search_btn is not None:
+            self._search_btn.configure(state="normal")
+        if self._search_label is not None:
+            self._search_label.configure(text="")
         self._destroy_page_widgets()
         self.sections = []
         self.results = []
@@ -5092,46 +6037,179 @@ class GalleryPanel(ttk.LabelFrame):
 
     # -- search ---------------------------------------------------------------
     def build_search_bar(self, parent) -> ttk.Frame:
-        """The Find-text bar, built into `parent` (the top control bar, so it
-        sits right under the dates).  English and Gujarati both work - the
-        entry is given the Gujarati-capable UI font."""
+        """The search bar, built into `parent` (the top control bar, so it
+        sits right under the dates).
+
+        Default state is deliberately just two things - the word "Search" and
+        somewhere to type.  Everything else earns its place by being usable:
+
+          * The field is a Combobox, so recent searches are one click away in
+            the native dropdown instead of a second panel nobody asked for.
+            Picking one runs it - retyping a query you already ran is the
+            manual step this removes.
+          * Clear is NOT on screen until there is a query to clear, and
+            Clear-search-history only exists as a row while there IS a
+            history.  A Remove control with nothing to remove is clutter that
+            also lies about the state.
+          * Right-click offers removing the one entry, because the native
+            dropdown cannot carry a per-row ✕.
+
+        English and Gujarati both work: the field AND the dropdown list get
+        the Gujarati-capable UI font (the dropdown is a plain Tk listbox and
+        does not inherit the Combobox's own font, so a Gujarati recent search
+        would otherwise be a row of boxes)."""
         bar = ttk.Frame(parent)
-        ttk.Label(bar, text="Find text:").pack(side="left")
-        entry = ttk.Entry(bar, textvariable=self.search_var, width=30,
-                          font=(find_gujarati_ui_font(self.winfo_toplevel()),
-                                10))
-        entry.pack(side="left", padx=(4, 4))
-        entry.bind("<Return>", lambda _e: self._fire_search())
+        font_family = find_gujarati_ui_font(self.winfo_toplevel())
+        ttk.Label(bar, text="Search:").pack(side="left")
+
+        self.winfo_toplevel().option_add("*TCombobox*Listbox.font",
+                                         (font_family, 10))
+        combo = ttk.Combobox(bar, textvariable=self.search_var, width=28,
+                             font=(font_family, 10), values=[])
+        combo.pack(side="left", padx=(4, 4))
+        combo.bind("<Return>", lambda _e: self._fire_search())
+        combo.bind("<<ComboboxSelected>>", self._on_history_pick)
+        combo.bind("<Button-3>", self._popup_history_menu)
+        self._search_combo = combo
+
         self._search_btn = ttk.Button(bar, text="Search", width=9,
                                       command=self._fire_search)
         self._search_btn.pack(side="left")
-        ttk.Button(bar, text="Clear", width=7,
-                   command=self.clear_search).pack(side="left", padx=(4, 0))
-        ttk.Checkbutton(bar, text="Show only matches",
-                        variable=self._search_only,
-                        command=self._refresh_after_search).pack(
-            side="left", padx=(10, 0))
-        self._search_label = ttk.Label(bar, text="", foreground="#2563eb")
+        # Built now, packed only when there is something to clear.  Clear is
+        # also the way BACK to the whole gallery, which is why it appears
+        # exactly when a search is narrowing the view.
+        self._clear_btn = ttk.Button(bar, text="Clear", width=7,
+                                     command=self.clear_search)
+        self._search_label = ttk.Label(bar, text="", foreground="#1d4ed8")
         self._search_label.pack(side="left", padx=(10, 0))
+
+        self._history_menu = tk.Menu(bar, tearoff=0)
+        self.search_var.trace_add("write", lambda *_a: self._sync_clear_btn())
+        self.refresh_history()
+        self._sync_clear_btn()
         return bar
+
+    # -- recent searches ------------------------------------------------------
+    #: Bottom row of the dropdown.  Not a query - see _on_history_pick.
+    CLEAR_HISTORY_ROW = "—  Clear search history  —"
+
+    def recent_searches(self) -> List[str]:
+        """The saved queries, newest first (the dropdown minus its action
+        row).  Public so the QA harness can assert on it."""
+        values = list(self._search_combo.cget("values")) \
+            if self._search_combo is not None else []
+        return [v for v in values if v != self.CLEAR_HISTORY_ROW]
+
+    def refresh_history(self) -> None:
+        """Re-read the saved searches into the dropdown.
+
+        The Clear row is appended only when the history is not empty, so an
+        untouched install opens a dropdown with nothing in it rather than one
+        offering to clear nothing."""
+        if self._search_combo is None:
+            return
+        recent = search_store.load_recent()
+        self._search_combo.configure(
+            values=recent + ([self.CLEAR_HISTORY_ROW] if recent else []))
+
+    def _on_history_pick(self, _event=None) -> None:
+        """A row of the dropdown was chosen: run it, or clear the history."""
+        picked = self.search_var.get()
+        if picked == self.CLEAR_HISTORY_ROW:
+            # Put the field back the way it was - picking an action row must
+            # not leave its own label sitting in the search box.
+            self.search_var.set("")
+            search_store.clear_recent()
+            self.refresh_history()
+            if self._search_label is not None:
+                self._search_label.configure(text="search history cleared")
+            return
+        # Apply it immediately: the whole point of the list is not retyping.
+        self._fire_search()
+
+    def _popup_history_menu(self, event) -> None:
+        """Right-click: remove just this query, or the lot.  Only offered
+        when there is actually something to remove."""
+        if self._history_menu is None:
+            return
+        menu = self._history_menu
+        menu.delete(0, "end")
+        query = self.search_var.get().strip()
+        recent = search_store.load_recent()
+        if query and any(search_store.same_query(query, item)
+                         for item in recent):
+            menu.add_command(label=f"Remove  “{query}”  from history",
+                             command=lambda: self._forget(query))
+        if recent:
+            menu.add_command(label="Clear search history",
+                             command=self._clear_history)
+        if menu.index("end") is None:    # Tk's "no entries" answer
+            return                       # nothing to offer - show no menu
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _forget(self, query: str) -> None:
+        search_store.forget_search(query)
+        self.refresh_history()
+
+    def _clear_history(self) -> None:
+        search_store.clear_recent()
+        self.refresh_history()
+
+    def _sync_clear_btn(self) -> None:
+        """Show Clear only while there is a query to clear.
+
+        winfo_manager(), not winfo_ismapped(): minimising the window makes
+        every child report "not mapped", so an ismapped() test would think
+        Clear was already gone and skip the pack_forget - and the button
+        would be sitting there, query-less, when the window came back."""
+        if self._clear_btn is None or self._search_label is None:
+            return
+        wanted = bool(self.search_var.get().strip())
+        shown = bool(self._clear_btn.winfo_manager())
+        if wanted and not shown:
+            # `before` keeps it in its slot; a bare pack() would append it
+            # after the result label and the bar would reshuffle as you type.
+            self._clear_btn.pack(side="left", padx=(4, 0),
+                                 before=self._search_label)
+        elif shown and not wanted:
+            self._clear_btn.pack_forget()
 
     def _fire_search(self) -> None:
         query = self.search_var.get().strip()
-        if not query:
+        if not query or query == self.CLEAR_HISTORY_ROW:
             self.clear_search()
+            return
+        # A search already running?  start_search() drops the second one on
+        # the floor, so firing anyway would disable the button, print
+        # "searching..." and save a query to the history that never ran -
+        # and then show the FIRST query's result under the second one's
+        # label.  The button's own disabled state is that flag.
+        if self._search_btn is not None and \
+                "disabled" in self._search_btn.state():
             return
         if self.on_search is not None:
             if self._search_btn is not None:
                 self._search_btn.configure(state="disabled")
             if self._search_label is not None:
                 self._search_label.configure(text="searching...")
+            # Saved before the results come back: a search the user ran is
+            # worth remembering whether or not it found anything.
+            search_store.remember_search(query)
+            self.refresh_history()
             self.on_search(query)
 
     def clear_search(self) -> None:
-        """Drop the highlights and show every notice again."""
+        """Drop the highlights and show every notice again.  The saved
+        history is NOT touched - this clears the search, not the memory of
+        it (that is the dropdown's own row)."""
         self.search_var.set("")
         for result in self.results:
             result.match_boxes = []
+            result.matched = False
+            result.match_query_text = ""
         if self._search_label is not None:
             self._search_label.configure(text="")
         if self._search_btn is not None:
@@ -5152,27 +6230,58 @@ class GalleryPanel(ttk.LabelFrame):
             self._search_label.configure(
                 text=f"no match for “{query}” in {scanned} notices")
         self._refresh_after_search()
-        # Land on the first paper that actually has a hit.
+        # Land on the first paper that actually has a hit.  `matched`, not
+        # `match_boxes` - a paper whose only hit came from a glued OCR word
+        # has no boxes and was skipped straight past.
         for index, section in enumerate(self.sections):
-            if any(r.match_boxes for r in section["results"]):  # type: ignore
+            if any(r.matched for r in section["results"]):   # type: ignore
                 self.goto_page(self._page_of(index, 0), user=False)
                 break
 
+    def refresh_filters(self) -> None:
+        """Public name for "something changed what should be on screen"."""
+        self._refresh_after_search()
+
     def _refresh_after_search(self) -> None:
+        """Re-render after a filter changed.  Also tells the Application, so
+        the "N of M notices" count cannot drift from what is on screen."""
         self._pages_cache = []
         self._page_index = 0
         self._render_page()
+        if self.on_filter_change is not None:
+            self.on_filter_change()
+        if self.on_page_change is not None:
+            self.on_page_change()
 
     def has_search(self) -> bool:
         return bool(self.search_var.get().strip())
 
+    def visible_results(self) -> List[NoticeResult]:
+        """Every notice the current filters let through, in gallery order.
+
+        This is what "all" means to someone looking at the screen.  Filtering
+        to જાહેર ચેતવણી, pressing Save All and getting the notices you just
+        filtered out is the same class of bug as counting a match you then
+        refuse to show."""
+        return [result
+                for index in range(len(self.sections))
+                for result in self._visible_results(index)]
+
     def selected_results(self) -> List[NoticeResult]:
-        """Ticked notices across EVERY page (un-ticking is remembered when
-        you move between papers)."""
+        """Ticked notices across every page of the CURRENT view (un-ticking
+        is remembered when you move between papers)."""
         self._harvest_selection()
-        return [r for r in self.results if id(r) not in self._deselected]
+        return [r for r in self.visible_results()
+                if id(r) not in self._deselected]
+
+    def is_filtered(self) -> bool:
+        """Is anything narrowing the gallery right now?"""
+        return self.has_search() or active_notice_type() != "all"
 
     def all_results(self) -> List[NoticeResult]:
+        """EVERY notice of the run, filters ignored.  Searching and
+        classifying have to see them all - a notice hidden by the type
+        buttons must still be findable by the search that clears them."""
         return list(self.results)
 
     def pending_count(self) -> int:
@@ -5219,11 +6328,61 @@ class GalleryPanel(ttk.LabelFrame):
 
     # -- paging model ---------------------------------------------------------
     def _visible_results(self, section_index: int) -> List[NoticeResult]:
-        """A section's notices, honouring the 'show only matches' filter."""
-        results = list(self.sections[section_index]["results"])  # type: ignore
-        if self._search_only.get() and self.has_search():
-            return [r for r in results if r.match_boxes]
-        return results
+        """A section's notices, narrowed by whatever the user has asked for.
+
+        Searching narrows the gallery on its own - there is no "show only
+        matches" box to find and tick afterwards.  Asking for something and
+        then being shown everything, with the answer highlighted somewhere
+        among it, is not a search result.  Clear (which appears exactly when
+        a search is on) is the way back to the whole gallery.
+
+        Filters on `matched`, not on `match_boxes`: a notice whose OCR glued
+        the phrase together matches with no boxes, and filtering by boxes hid
+        exactly the notices the counter had just promised."""
+        results = [r for r in self.sections[section_index]["results"]  # type: ignore
+                   if not r.needs_review and not r.rejected
+                   and (self.show_hidden or not r.demoted)]
+        if self.has_search():
+            results = [r for r in results if r.matched]
+        return [r for r in results if self.result_passes_type(r)]
+
+    def review_results(self) -> List[NoticeResult]:
+        """The Not Sure queue: everything detection was unsure about and has
+        not been ruled on yet.  Across every section - uncertainty is not a
+        per-newspaper idea, and a queue split six ways is a queue nobody
+        works through."""
+        return [r for r in self.results
+                if r.needs_review and not r.rejected]
+
+    def hidden_count(self) -> int:
+        """Notices the LEARNED model is holding back (not human rejections).
+        Shown next to the count, because a number that shrinks on its own
+        needs to say so."""
+        return sum(1 for r in self.results
+                   if r.demoted and not r.rejected and not r.needs_review)
+
+    @staticmethod
+    def result_passes_type(result: NoticeResult) -> bool:
+        """Does this notice survive the Notice-type buttons?
+
+        STRICT: a notice whose type could not be read does not match a
+        specific filter.  The first version let unknowns through on the
+        principle that hiding a real notice is the worst failure here - but
+        with 29% of real crops coming back unknown, "show me જાહેર ચેતવણી"
+        answered with a screen full of જાહેર નોટિસ, which is not a filter at
+        all.  Nothing is lost: the unknown count is reported next to the
+        buttons, and "All" is one click away."""
+        mode = active_notice_type()
+        return mode == "all" or result.notice_type == mode
+
+    def unidentified_count(self) -> int:
+        """Notices whose crop never told us which spelling they are.  Shown
+        beside the filter so a shrinking number always has a stated reason."""
+        return sum(1 for r in self.results if r.ocr_done and not r.notice_type)
+
+    def apply_type_filter(self) -> None:
+        """Re-render for a changed Notice-type choice."""
+        self._refresh_after_search()
 
     def _chunk_count(self, section_index: int) -> int:
         results = self._visible_results(section_index)
@@ -5305,17 +6464,62 @@ class GalleryPanel(ttk.LabelFrame):
         # label just sat there behind them.
         self._empty_label.grid_forget()
         card = NoticeCard(self._inner, result, self._on_open,
-                          self._on_save, self._on_click)
+                          self._on_save, self._on_click,
+                          self._on_copy, self._on_feedback)
         if id(result) in self._deselected:
             card.selected.set(False)
         self.cards.append(card)
         self._layout()
 
+    def _empty_text(self) -> str:
+        """What to say when there is nothing on screen.
+
+        Two different nothings.  Since a search now narrows the gallery by
+        itself, "found nothing" is a screen the user reaches often - and
+        telling them to press Extract, when they have just extracted 40
+        notices and searched for the wrong word, is the app blaming them for
+        its own filter."""
+        query = self.search_var.get().strip()
+        found = len(self.results)
+        if not found:
+            return ("No notices yet.\n\nChoose a newspaper and date above, "
+                    "then press Extract.")
+        tail = (f"\n\n{found} notice{'s' if found != 1 else ''} "
+                f"{'were' if found != 1 else 'was'} found in this run.")
+        if query:
+            return (f"No notice matches “{query}”.{tail}"
+                    "\nPress Clear to see them all.")
+        if active_notice_type() != "all":
+            unknown = self.unidentified_count()
+            note = (f"\n{unknown} of them could not be identified either way."
+                    if unknown else "")
+            return (f"No notice on screen is “{self.type_label()}”.{tail}"
+                    f"{note}\nChoose “All” above to see them.")
+        return ("No notices yet.\n\nChoose a newspaper and date above, "
+                "then press Extract.")
+
+    @staticmethod
+    def type_label() -> str:
+        """The Gujarati label of the active notice-type filter."""
+        mode = active_notice_type()
+        for choice in NOTICE_TYPE_CHOICES[1:]:
+            if ("ચેતવણ" in choice) == (mode == "chetavni") and \
+                    ("નોટ" in choice) == (mode == "notice"):
+                return choice
+        return NOTICE_TYPE_CHOICES[0]
+
     def _render_page(self) -> None:
         self._destroy_page_widgets()
         pages = self._page_list()
-        if not pages:
+        # A section always claims at least one page, so `pages` alone cannot
+        # tell us the screen is empty once a search has filtered everything
+        # out of every section.
+        nothing_visible = not any(
+            self._visible_results(index) for index in range(len(self.sections)))
+        if not pages or nothing_visible:
+            self._empty_label.configure(text=self._empty_text())
             self._empty_label.grid(row=0, column=0, padx=20, pady=30)
+            self._layout()          # size the canvas to the hint, not to 20px
             self._update_nav()
             return
         self._empty_label.grid_forget()
@@ -5323,7 +6527,8 @@ class GalleryPanel(ttk.LabelFrame):
         self._make_heading(self.page_label())
         for result in self._current_results():
             card = NoticeCard(self._inner, result, self._on_open,
-                              self._on_save, self._on_click)
+                              self._on_save, self._on_click,
+                              self._on_copy, self._on_feedback)
             if id(result) in self._deselected:
                 card.selected.set(False)
             self.cards.append(card)
@@ -5392,7 +6597,14 @@ class GalleryPanel(ttk.LabelFrame):
                 card.place(x=x_off + gap + col * (card_w + gap),
                            y=heights[col], width=card_w)
                 heights[col] += card.winfo_reqheight() + gap
-            total_h = max(heights) + gap
+            # The masonry only knows about PLACED children, so with no cards
+            # this came to gap+gap = 20 px and the canvas window was clamped
+            # to it - which silently cut off the "No notices yet - choose a
+            # newspaper..." hint that is gridded into the same frame.  An
+            # empty gallery therefore looked broken rather than empty.  The
+            # frame's own requested height covers whatever is gridded there;
+            # once cards exist the label is grid_forget()'d and it is 1.
+            total_h = max(max(heights) + gap, self._inner.winfo_reqheight())
             self._canvas.itemconfigure(self._window, height=total_h)
             self._canvas.configure(scrollregion=(0, 0, avail, total_h))
         except tk.TclError:
@@ -5519,6 +6731,370 @@ class DatePickerDialog(tk.Toplevel):
     def _pick(self, day: "date") -> None:
         self.destroy()
         self._on_pick(day)
+
+
+#: The step-by-step guide behind Help > How to use this app.
+#: (heading, [step, ...]) - plain sentences, in the order someone actually
+#: does them.  Kept as data rather than a wall of widget code so the wording
+#: can be corrected without touching layout.
+HELP_STEPS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("1.  Check the setup strip (first run only)", (
+        "The coloured row under the toolbar says whether everything needed "
+        "is installed: Packages, Tesseract, Gujarati data, Browser.",
+        "All green means you are ready.  Anything red: click it, or press "
+        "“Downloads & Setup…”, and install it with one button.",
+        "Gujarati data is the one that matters most - without it the app "
+        "starts fine and then quietly finds nothing.",
+    )),
+    ("2.  Choose what to extract", (
+        "Newspaper: pick one, or leave it on “All Newspapers” to sweep "
+        "Gujarat Samachar, Sandesh, Divya Bhaskar and Nav Gujarat Samay "
+        "together.",
+        "Dates: click the From and To buttons to open a calendar.  Both "
+        "default to today.  Set them to different days to cover a range.",
+        "Some papers only keep about a week online - the orange “Archive” "
+        "line says which.",
+        "Notice type: All, જાહેર નોટિસ only, or જાહેર ચેતવણી only.",
+        "Already have a file?  “Open PDF…” runs the same detection over any "
+        "e-paper PDF.",
+    )),
+    ("3.  Press Extract", (
+        "Every newspaper and date runs at the same time, and notices appear "
+        "as they are found - you do not have to wait for the whole run.",
+        "The progress bar and the line beside it show how far along it is.",
+        "Press “☰ Log” to watch the details, and ✕ to hide it again.",
+        "Cancel stops the run; whatever was already found stays on screen.",
+        "Divya Bhaskar needs a sign-in.  The first run opens a normal "
+        "browser window once; after that it is remembered.",
+    )),
+    ("4.  Look through what it found", (
+        "Notices are grouped by newspaper, edition and date.  Use "
+        "“<< Previous” and “Next >>”, or the drop-down between them, to move "
+        "between groups.",
+        "Click a notice to see it large on the right; double-click to open "
+        "it in its own window.",
+        "Zoom In / Zoom Out / 100% / Fit Width control the preview.",
+    )),
+    ("5.  Search inside the notices", (
+        "Type in the Search box and press Enter.  The gallery narrows to "
+        "the notices that match, and the matching words are highlighted in "
+        "blue on each one.",
+        "It searches the words INSIDE the notices, in Gujarati or English - "
+        "not just the headings.",
+        "Every word of your query has to appear somewhere in the notice, in "
+        "any order, so “public notice” and “notice public” find the same "
+        "thing.",
+        "The first search reads the notices, so it takes a few seconds; "
+        "after that it is instant.",
+        "Press Clear to go back to all of them.  Clear appears only while a "
+        "search is active.",
+        "The ▼ in the search box lists your recent searches - click one to "
+        "run it again.  Right-click the box to remove one.",
+    )),
+    ("6.  Filter by notice type", (
+        "The Notice type buttons also filter what is already on screen: "
+        "click જાહેર ચેતવણી and only those stay.",
+        "The green note beside them says how many of each there are.",
+        "An empty result means this run genuinely found none of that type - "
+        "click All to see everything again.",
+    )),
+    ("7.  Save the ones you want", (
+        "Every notice has a Select tick.  Untick the ones you do not want.",
+        "“Save Selected…” writes the ticked ones, “Save All…” writes "
+        "everything on screen - so if a filter or a search is active, it "
+        "saves what you are looking at.",
+        "“Save” on a single notice writes just that one.",
+        "Nothing is written to disk until you press Save.  Closing the app "
+        "clears everything else it created.",
+    )),
+    ("If something looks wrong", (
+        "Nothing found?  Check the setup strip is green, and that the date "
+        "is one the paper still has online.",
+        "Wrong notice type shown?  The type is read from the printed "
+        "heading; a badly printed one can be unreadable.",
+        "Tenders (નિવિદા), auctions (હરાજી) and recruitment ads are "
+        "filtered out on purpose.",
+        "Help > About lists what the app supports.",
+    )),
+)
+
+
+class ReviewDialog(tk.Toplevel):
+    """The Not Sure queue - the ONLY place "This Is Right" exists.
+
+    Detection puts a notice here when its header scored in the uncertain
+    band (DetectionConfig.review_low): too weak for the results, too close
+    to throw away.  Those used to be dropped silently, which is how a real
+    court notice went missing on page 15 of a real edition.
+
+    Both buttons belong here and only here, because here the app genuinely
+    does not know.  On a normal result card it does - so that card asks one
+    question ("is this relevant?") with one answer, instead of making the
+    user confirm every notice the app already got right."""
+
+    def __init__(self, master, results: List[NoticeResult],
+                 on_verdict: Callable[[NoticeResult, str], None],
+                 guj_font_family: str):
+        super().__init__(master)
+        self.title("Not Sure - review these")
+        self.transient(master.winfo_toplevel())
+        self.geometry("760x680")
+        self.minsize(520, 420)
+        self._queue = list(results)
+        self._on_verdict = on_verdict
+        self._font = guj_font_family
+        self._photo = None
+        self._decided = 0
+
+        head = ttk.Frame(self, padding=(14, 12, 14, 6))
+        head.pack(fill="x")
+        self._title = ttk.Label(head, text="", font=(guj_font_family, 12,
+                                                     "bold"))
+        self._title.pack(anchor="w")
+        self._meta = ttk.Label(head, text="", foreground="#555555")
+        self._meta.pack(anchor="w")
+        ttk.Label(head, foreground="#767676", wraplength=700, justify="left",
+                  text="These scored just below the confidence needed for "
+                       "the results list.  Your answer is remembered and "
+                       "used to judge similar notices next time.").pack(
+            anchor="w", pady=(6, 0))
+
+        # Zoom + scroll, because the question here is "is this a notice?"
+        # and a page-width thumbnail of dense Gujarati body type cannot be
+        # read.  Judging what you cannot read is guessing, and a guess
+        # recorded as training evidence is worse than no evidence.
+        zoom_bar = ttk.Frame(self, padding=(14, 0))
+        zoom_bar.pack(fill="x")
+        for label, command in (("Fit", lambda: self._zoom_to(None)),
+                               ("100%", lambda: self._zoom_to(1.0)),
+                               ("+", lambda: self._zoom_by(1.25)),
+                               ("−", lambda: self._zoom_by(1 / 1.25))):
+            ttk.Button(zoom_bar, text=label, width=6,
+                       command=command).pack(side="left", padx=(0, 4))
+        self._zoom_label = ttk.Label(zoom_bar, text="", foreground="#767676")
+        self._zoom_label.pack(side="left", padx=(8, 0))
+        ttk.Label(zoom_bar, foreground="#767676",
+                  text="scroll to pan  ·  Ctrl+scroll to zoom").pack(
+            side="right")
+
+        holder = ttk.Frame(self, padding=(14, 4))
+        holder.pack(fill="both", expand=True)
+        self._canvas = tk.Canvas(holder, background="#f0f0f0",
+                                 highlightthickness=0)
+        vbar = ttk.Scrollbar(holder, orient="vertical",
+                             command=self._canvas.yview)
+        hbar = ttk.Scrollbar(holder, orient="horizontal",
+                             command=self._canvas.xview)
+        self._canvas.configure(yscrollcommand=vbar.set,
+                               xscrollcommand=hbar.set)
+        vbar.pack(side="right", fill="y")
+        hbar.pack(side="bottom", fill="x")
+        self._canvas.pack(side="left", fill="both", expand=True)
+        #: None = fit the window; a number = that scale exactly.
+        self._zoom: Optional[float] = None
+        self._canvas.bind("<MouseWheel>", self._on_wheel)
+        self._canvas.bind("<Control-MouseWheel>", self._on_ctrl_wheel)
+        self._canvas.bind("<Configure>", lambda _e: self._render_image())
+
+        buttons = ttk.Frame(self, padding=(14, 10))
+        buttons.pack(fill="x", side="bottom")
+        self._right_btn = ttk.Button(
+            buttons, text="✓ This Is Right", width=18,
+            style="Confirm.TButton",
+            command=lambda: self._decide("positive"))
+        self._right_btn.pack(side="left")
+        self._wrong_btn = ttk.Button(
+            buttons, text="✕ Not Related", width=16, style="Reject.TButton",
+            command=lambda: self._decide("negative"))
+        self._wrong_btn.pack(side="left", padx=(8, 0))
+        self._skip_btn = ttk.Button(buttons, text="Skip", width=8,
+                                    command=self._skip)
+        self._skip_btn.pack(side="left", padx=(8, 0))
+        ttk.Button(buttons, text="Close", width=9,
+                   command=self.destroy).pack(side="right")
+        self._progress = ttk.Label(buttons, text="", foreground="#767676")
+        self._progress.pack(side="right", padx=(0, 12))
+
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self._show()
+        self.update_idletasks()
+        parent = master.winfo_toplevel()
+        self.geometry(f"+{max(0, parent.winfo_rootx() + 60)}"
+                      f"+{max(0, parent.winfo_rooty() + 40)}")
+
+    # -- queue ----------------------------------------------------------------
+    def _current(self) -> Optional[NoticeResult]:
+        return self._queue[0] if self._queue else None
+
+    def _decide(self, verdict: str) -> None:
+        result = self._current()
+        if result is None:
+            return
+        self._queue.pop(0)
+        self._decided += 1
+        self._on_verdict(result, verdict)
+        self._show()
+
+    def _skip(self) -> None:
+        """Leave it in the queue, look at the next one.  Not answering is a
+        legitimate answer - a guess recorded as evidence is worse than no
+        evidence."""
+        if len(self._queue) > 1:
+            self._queue.append(self._queue.pop(0))
+            self._show()
+
+    def _show(self) -> None:
+        result = self._current()
+        for widget in ("_right_btn", "_wrong_btn", "_skip_btn"):
+            getattr(self, widget).configure(
+                state="normal" if result is not None else "disabled")
+        self._canvas.delete("all")
+        if result is None:
+            self._title.configure(text="Nothing left to review")
+            self._meta.configure(
+                text=f"{self._decided} decision(s) recorded."
+                     if self._decided else "The queue is empty.")
+            self._progress.configure(text="")
+            self._canvas.create_text(
+                20, 30, anchor="nw", fill="#767676",
+                font=(self._font, 10),
+                text="Anything detection is unsure about will appear here\n"
+                     "after the next extraction.")
+            return
+        self._title.configure(text=f"Notice {result.result_id}")
+        self._meta.configure(
+            text=f"{result.newspaper}  ·  {result.caption}")
+        self._progress.configure(text=f"{len(self._queue)} left")
+        self._zoom = None                 # each notice starts fitted
+        self._render_image()
+
+    # -- zoom -----------------------------------------------------------------
+    def _effective_zoom(self, pil) -> float:
+        if self._zoom is not None:
+            return self._zoom
+        width = max(200, self._canvas.winfo_width() or 700)
+        height = max(200, self._canvas.winfo_height() or 380)
+        return min(width / pil.width, height / pil.height, 1.0)
+
+    def _zoom_to(self, value: Optional[float]) -> None:
+        self._zoom = value
+        self._render_image()
+
+    def _zoom_by(self, factor: float) -> None:
+        result = self._current()
+        if result is None:
+            return
+        try:
+            pil = bgr_to_pil(result.image_bgr)
+        except Exception:
+            return
+        self._zoom = clamp(self._effective_zoom(pil) * factor, 0.1, 6.0)
+        self._render_image()
+
+    def _on_wheel(self, event) -> None:
+        self._canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+
+    def _on_ctrl_wheel(self, event) -> None:
+        self._zoom_by(1.25 if event.delta > 0 else 1 / 1.25)
+
+    def _render_image(self) -> None:
+        result = self._current()
+        self._canvas.delete("all")
+        if result is None:
+            return
+        try:
+            pil = bgr_to_pil(result.image_bgr)
+            scale = self._effective_zoom(pil)
+            width = max(1, int(pil.width * scale))
+            height = max(1, int(pil.height * scale))
+            self._photo = ImageTk.PhotoImage(
+                pil.resize((width, height), Image.LANCZOS))
+            self._canvas.create_image(0, 0, anchor="nw", image=self._photo)
+            self._canvas.configure(scrollregion=(0, 0, width, height))
+            self._zoom_label.configure(
+                text=f"{scale * 100:.0f}%"
+                     + ("  (fit)" if self._zoom is None else ""))
+        except Exception:
+            self._canvas.create_text(20, 20, anchor="nw",
+                                     text="(image unavailable)")
+
+
+class HelpDialog(tk.Toplevel):
+    """Step-by-step guide (Help > How to use this app).
+
+    Scrollable, because it is longer than a dialog: a guide that only fits
+    by cutting steps is not a guide.  Uses the Gujarati-capable UI font -
+    half the words on the buttons it describes are Gujarati."""
+
+    def __init__(self, master, guj_font_family: str):
+        super().__init__(master)
+        self.title(f"How to use {APP_NAME}")
+        self.transient(master.winfo_toplevel())
+        self.geometry("680x620")
+        self.minsize(460, 360)
+
+        outer = ttk.Frame(self, padding=(4, 4))
+        outer.pack(fill="both", expand=True)
+        canvas = tk.Canvas(outer, highlightthickness=0, background="#ffffff")
+        bar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=bar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        bar.pack(side="right", fill="y")
+
+        body = tk.Frame(canvas, background="#ffffff")
+        window = canvas.create_window((0, 0), window=body, anchor="nw")
+
+        def _resize(event):
+            canvas.itemconfigure(window, width=event.width)
+        canvas.bind("<Configure>", _resize)
+        body.bind("<Configure>",
+                  lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        # Bound on the DIALOG, not bind_all: the Application installs a
+        # global <MouseWheel> handler for the gallery, and a bind_all here
+        # would replace it - then unbinding on close would leave the app
+        # unable to scroll at all.  Tk walks a child's bindtags up to its
+        # toplevel, so this still catches the wheel anywhere in the dialog.
+        self.bind("<MouseWheel>", lambda e: canvas.yview_scroll(
+            -1 if e.delta > 0 else 1, "units"))
+
+        tk.Label(body, text=f"How to use {APP_NAME}",
+                 font=(guj_font_family, 14, "bold"), background="#ffffff",
+                 anchor="w").pack(fill="x", padx=16, pady=(14, 2))
+        tk.Label(body, text="Finding જાહેર નોટિસ and જાહેર ચેતવણી in the "
+                            "Gujarati e-papers, start to finish.",
+                 font=(guj_font_family, 10), background="#ffffff",
+                 foreground="#444444", anchor="w",
+                 justify="left", wraplength=600).pack(fill="x", padx=16,
+                                                      pady=(0, 6))
+
+        for heading, steps in HELP_STEPS:
+            tk.Label(body, text=heading, font=(guj_font_family, 11, "bold"),
+                     background="#ffffff", foreground="#20486e", anchor="w",
+                     justify="left", wraplength=600).pack(
+                fill="x", padx=16, pady=(14, 2))
+            for step in steps:
+                row = tk.Frame(body, background="#ffffff")
+                row.pack(fill="x", padx=(28, 16), pady=1)
+                tk.Label(row, text="•", font=(guj_font_family, 10),
+                         background="#ffffff", foreground="#767676").pack(
+                    side="left", anchor="n")
+                tk.Label(row, text=step, font=(guj_font_family, 10),
+                         background="#ffffff", foreground="#1a1a1a",
+                         anchor="w", justify="left", wraplength=560).pack(
+                    side="left", fill="x", expand=True, padx=(6, 0))
+
+        buttons = ttk.Frame(self, padding=(12, 8))
+        buttons.pack(fill="x", side="bottom")
+        ttk.Button(buttons, text="Close", width=10,
+                   command=self.destroy).pack(side="right")
+        self.bind("<Escape>", lambda _e: self.destroy())
+
+        self.update_idletasks()
+        parent = master.winfo_toplevel()
+        x = parent.winfo_rootx() + (parent.winfo_width()
+                                    - self.winfo_width()) // 2
+        y = parent.winfo_rooty() + 40
+        self.geometry(f"+{max(0, x)}+{max(0, y)}")
 
 
 class AboutDialog(tk.Toplevel):
@@ -5677,6 +7253,12 @@ class Application(ttk.Frame):
         # one is filled in so the click is unmistakable.
         style.configure("NoticeType.Toolbutton", font=(self._guj_ui_font, 10),
                         padding=(10, 3), anchor="center")
+        # Feedback buttons: the reject is the one on every card, so it is
+        # readable but not loud; the confirm exists only in the review
+        # queue, where it is the primary action.
+        style.configure("Reject.TButton", foreground="#a11515")
+        style.configure("Confirm.TButton", foreground="#0a6b0a")
+
         style.map("NoticeType.Toolbutton",
                   background=[("selected", "#20486e"), ("active", "#cfe0f5")],
                   foreground=[("selected", "#ffffff")],
@@ -5713,6 +7295,9 @@ class Application(ttk.Frame):
         menubar.add_cascade(label="Downloads", menu=downloads_menu)
 
         help_menu = tk.Menu(menubar, tearoff=0)
+        help_menu.add_command(label="How to use this app...",
+                              command=self._show_help)
+        help_menu.add_separator()
         help_menu.add_command(label="About...", command=self._show_about)
         menubar.add_cascade(label="Help", menu=help_menu)
         self.root.config(menu=menubar)
@@ -6125,6 +7710,9 @@ class Application(ttk.Frame):
     def _show_about(self) -> None:
         AboutDialog(self.root, self._guj_ui_font)
 
+    def _show_help(self) -> None:
+        HelpDialog(self.root, self._guj_ui_font)
+
     # -- layout ---------------------------------------------------------------
     def _build_ui(self) -> None:
         # ---- Top: extraction controls --------------------------------------
@@ -6258,19 +7846,25 @@ class Application(ttk.Frame):
         paned = ttk.PanedWindow(self, orient="horizontal")
         paned.pack(fill="both", expand=True, padx=8, pady=4)
         self._paned = paned
-        self._log_visible = True
+        # Closed by default.  The log is a diagnostic, not the point of the
+        # screen - it was taking a third of the window from the notices,
+        # which are what the user came for.  It keeps recording while
+        # hidden (the Text widget buffers off-screen), and the ☰ Log button
+        # next to the progress bar brings it back with everything still in
+        # it.
+        self._log_visible = False
 
         self.log_panel = StatusLogPanel(paned, on_close=self.toggle_log)
-        paned.add(self.log_panel, weight=1)
-        # The first layout pass decides the sash positions; claim a usable
-        # width for the log before the gallery and preview take everything.
-        self.after(120, self._restore_log_width)
+        self._show_log_btn.pack(side="left", padx=(0, 8), before=self.progress)
 
         self.gallery = GalleryPanel(paned,
                                     on_open=self.open_preview_window,
                                     on_save=self.save_single,
                                     on_click=self.show_in_preview)
         self.gallery.on_search = self.start_search
+        self.gallery.on_filter_change = self._drop_hidden_preview
+        self.gallery._on_copy = self.copy_single
+        self.gallery._on_feedback = self.on_feedback
         paned.add(self.gallery, weight=2)
         # Right of the dates, directly below the E-paper URL field (col 3 is
         # the URL's own - wide - column; deps button keeps cols 4-5).
@@ -6311,6 +7905,21 @@ class Application(ttk.Frame):
         self.save_all_btn.pack(side="right")
         self.count_label = ttk.Label(actions, text="0 notices")
         self.count_label.pack(side="left")
+        # The Not Sure queue.  Shown always, labelled with its size, so the
+        # existence of items the app was unsure about is never a surprise.
+        self.review_btn = ttk.Button(actions, text="Not Sure (0)", width=16,
+                                     command=self.open_review,
+                                     state="disabled")
+        self.review_btn.pack(side="left", padx=(14, 0))
+        self.show_hidden_var = tk.BooleanVar(value=False)
+        # Created disabled, like the Not Sure button beside it: with nothing
+        # hidden there is nothing for it to show, and a control that looks
+        # clickable and does nothing is the "dead UI control" this project
+        # has spent a session removing.
+        self.show_hidden_check = ttk.Checkbutton(
+            actions, text="Show hidden", variable=self.show_hidden_var,
+            command=self._toggle_hidden, state="disabled")
+        self.show_hidden_check.pack(side="left", padx=(10, 0))
 
         self.status_bar = ttk.Label(self, text="Ready", relief="sunken",
                                     anchor="w", padding=(6, 2))
@@ -6361,17 +7970,76 @@ class Application(ttk.Frame):
 
     # -- date picker & URL auto-fill -----------------------------------------
     def _on_notice_type(self, choice: str) -> None:
-        """Apply the notice-type choice immediately and confirm it on screen.
+        """Apply the notice-type choice immediately - to the NEXT run and to
+        what is already on screen.
 
         It used to be a dropdown whose value only took effect when Extract
-        started, so a click looked like nothing happened."""
+        started, so a click looked like nothing happened.  Then it became
+        buttons that set the filter for the next run - which still looked
+        like nothing happened when there were already notices in the gallery.
+        Clicking a filter has to filter something you can see."""
         set_notice_type(choice)
         label = "all notice types" if choice == NOTICE_TYPE_CHOICES[0] \
             else f"“{choice}” only"
-        self._type_hint.configure(text=f"✓ extracting {label}")
         self.status_bar.configure(text=f"Notice type: {label}")
-        # The tick is confirmation of a click, not a permanent label.
-        self.after(2500, lambda: self._type_hint.configure(text=""))
+
+        if not self.gallery.results:
+            self._type_hint.configure(text=f"✓ extracting {label}")
+            # The tick is confirmation of a click, not a permanent label.
+            self.after(2500, lambda: self._type_hint.configure(text=""))
+            return
+        self._apply_notice_type_filter(label)
+
+    def _apply_notice_type_filter(self, label: str) -> None:
+        """Narrow the gallery to the chosen notice type.
+
+        A notice's type is read off its own crop, which detection never read
+        (it only OCRs the header strip), so the first click may have to read
+        them - on a worker thread, exactly like the first search does."""
+        results = self.gallery.all_results()
+        if all(r.ocr_done for r in results):
+            self.gallery.apply_type_filter()
+            self._show_type_count(label)
+            return
+        if self._searching:            # a read is already in flight
+            return
+        self._searching = True
+        self._type_hint.configure(text="reading notices...")
+        msg_queue = self._msg_queue
+
+        def run() -> None:
+            try:
+                read_notice_crops(
+                    results, select_ocr_engine(_SilentReporter()),
+                    log=lambda text: msg_queue.put(
+                        ("log", f"[Notice type] {text}", "dim")))
+            except Exception:
+                msg_queue.put(("log", "[Notice type] failed:\n"
+                               + traceback.format_exc(), "error"))
+            finally:
+                msg_queue.put(("types_done", label))
+
+        threading.Thread(target=run, daemon=True,
+                         name="notice-type").start()
+
+    def _show_type_count(self, label: str) -> None:
+        """Say how many of the notices on screen survived the filter - and
+        how many were left out because their crop never said which they are.
+        A number that shrinks for an unstated reason is the thing to avoid."""
+        results = self.gallery.all_results()
+        shown = sum(1 for r in results
+                    if self.gallery.result_passes_type(r))
+        if active_notice_type() == "all":
+            text = f"✓ showing all {len(results)} notice(s)"
+        else:
+            text = f"✓ {shown} of {len(results)} notice(s) are {label}"
+            unknown = self.gallery.unidentified_count()
+            if unknown:
+                text += (f"   ({unknown} could not be identified - "
+                         "press All to see them)")
+        self._type_hint.configure(text=text)
+        self.after(6000, lambda: self._type_hint.configure(text=""))
+        self._update_count()
 
     def _is_all_mode(self) -> bool:
         return self.newspaper_var.get() == ALL_NEWSPAPERS_LABEL
@@ -6573,6 +8241,14 @@ class Application(ttk.Frame):
         set_notice_type(self.notice_type_var.get())
         self._msg_queue = queue.Queue()
         self._cancel_event = threading.Event()
+        # A background crop read (Find-text, or a Notice-type click) captured
+        # the OLD queue when it started, so the "done" message that clears
+        # this flag is now unreachable - nothing drains that queue any more.
+        # Left set, _searching stays True for the life of the process and
+        # every later search and notice-type click is silently refused.  The
+        # flag's lifetime belongs to the queue generation, so it is reset
+        # here, at the one place the queue is replaced.
+        self._searching = False
         self.extract_btn.configure(state="disabled")
         self.cancel_btn.configure(state="normal")
         self.save_all_btn.configure(state="disabled")
@@ -6782,17 +8458,39 @@ class Application(ttk.Frame):
         Bounded because eight agents can put thousands of messages in one
         tick, and handling them all before returning to Tk is exactly how a
         click ends up waiting a second to be noticed.  Hitting the cap
-        reschedules immediately, so nothing is delayed - only interleaved."""
+        reschedules immediately, so nothing is delayed - only interleaved.
+
+        This pump is the ONLY bridge from the worker threads to the window,
+        and it used to reschedule itself on the last line of the happy path.
+        So any exception out of a handler skipped the reschedule and killed
+        it for good: the window stayed up, the run kept going, and nothing
+        it produced ever reached the screen again - no notices, no log
+        lines, and `_searching` stuck true forever because the message that
+        clears it could no longer be delivered.  It cost a QA run before it
+        was spotted, and the only visible symptom was a search timing out.
+
+        So: one bad message is logged and skipped, and the reschedule
+        happens in a `finally` where nothing can step over it."""
         drained = 0
         try:
             while drained < MSG_PER_TICK:
                 message = self._msg_queue.get_nowait()
                 drained += 1
-                self._handle_message(message)
+                try:
+                    self._handle_message(message)
+                except Exception:
+                    run_logger.log(
+                        f"message handler failed for {message[0]!r}:\n"
+                        + traceback.format_exc(), "error")
         except queue.Empty:
             pass
-        self.root.after(1 if drained >= MSG_PER_TICK else POLL_INTERVAL_MS,
-                        self._poll_queue)
+        finally:
+            try:
+                self.root.after(
+                    1 if drained >= MSG_PER_TICK else POLL_INTERVAL_MS,
+                    self._poll_queue)
+            except tk.TclError:
+                pass                     # the window is going away
 
     def _handle_message(self, message: tuple) -> None:
         kind = message[0]
@@ -6833,6 +8531,10 @@ class Application(ttk.Frame):
             _query, matched, scanned = message[1], message[2], message[3]
             self.gallery.search_finished(_query, matched, scanned)
             self._update_count()
+        elif kind == "types_done":
+            self._searching = False
+            self.gallery.apply_type_filter()
+            self._show_type_count(message[1])
         elif kind == "deps_done":
             self._dependencies_finished(message[1])
             self.refresh_setup_status()      # an install may have fixed things
@@ -6896,26 +8598,10 @@ class Application(ttk.Frame):
             matched = 0
             try:
                 engine = select_ocr_engine(_SilentReporter())
-                pending = [r for r in results if not r.ocr_done]
-                if engine is not None and pending:
-                    msg_queue.put(("log", f"[Search] reading {len(pending)} "
-                                          "notice(s) with "
-                                          f"{engine.name}...", "dim"))
-
-                    def read(result: NoticeResult) -> None:
-                        try:
-                            gray = cv2.cvtColor(result.image_bgr,
-                                                cv2.COLOR_BGR2GRAY)
-                            result.ocr_words = engine.read_words(gray)
-                            result.ocr_text = " ".join(
-                                w.text for w in result.ocr_words)
-                        except Exception:
-                            result.ocr_words = []
-                            result.ocr_text = ""
-                        finally:
-                            result.ocr_done = True
-
-                    list(get_ocr_pool().map(read, pending))
+                read_notice_crops(
+                    results, engine,
+                    log=lambda text: msg_queue.put(
+                        ("log", f"[Search] {text}", "dim")))
 
                 # Token search (utils/search.py): every word of the query has
                 # to appear somewhere in the notice, in any order.  A notice
@@ -6925,6 +8611,8 @@ class Application(ttk.Frame):
                     hit, boxes = search_notice(result.ocr_words,
                                                result.ocr_text, query)
                     result.match_boxes = boxes
+                    result.matched = hit
+                    result.match_query_text = query if hit else ""
                     if hit:
                         matched += 1
             except Exception:
@@ -6942,8 +8630,28 @@ class Application(ttk.Frame):
     def _update_count(self) -> None:
         # len(self.gallery.results), not all_results(): the latter copies the
         # whole list, and this runs once per notice as they stream in.
-        count = len(self.gallery.results)
+        # The Not Sure queue and anything the learned model is holding back.
+        # Both are notices that exist but are not on screen, so both have to
+        # be visible as numbers - a gallery that quietly shows fewer than it
+        # found is the failure this whole session keeps coming back to.
+        review = len(self.gallery.review_results())
+        self.review_btn.configure(
+            text=f"Not Sure ({review})",
+            state="normal" if review else "disabled")
+        hidden = self.gallery.hidden_count()
+        self.show_hidden_check.configure(
+            state="normal" if (hidden or self.gallery.show_hidden)
+            else "disabled")
+
+        count = len(self.gallery.results) - review
         text = f"{count} notice{'s' if count != 1 else ''}"
+        if self.gallery.is_filtered():
+            # Say what is on screen as well as what the run found, or the
+            # number and the gallery disagree with each other.
+            shown = len(self.gallery.visible_results())
+            text = f"{shown} of {count} notice{'s' if count != 1 else ''}"
+        if hidden and not self.gallery.show_hidden:
+            text += f"   ({hidden} hidden by learning)"
         label = self.gallery.page_label()
         if label:
             text += f"   -   {label}"
@@ -6952,6 +8660,110 @@ class Application(ttk.Frame):
                               in sorted(self._paper_counts.items()))
             text += f"   ({parts})"
         self.count_label.configure(text=text)
+
+    def _drop_hidden_preview(self) -> None:
+        """Stop previewing a notice the filter has just hidden.
+
+        The preview keeps whatever was last clicked.  Filter to જાહેર ચેતવણી
+        and the gallery correctly empties - while the panel on the right goes
+        on showing a જાહેર નોટિસ, which is exactly the thing the filter was
+        asked to stop showing.  The gallery said one thing and the biggest
+        image on screen said another."""
+        current = getattr(self.preview, "_result", None)
+        if current is None:
+            return
+        if not self.gallery.is_filtered():
+            return
+        visible = self.gallery.visible_results()
+        if current in visible:
+            return
+        # Show the first notice that DID survive, or nothing at all.
+        if visible:
+            self.preview.show_result(visible[0])
+        else:
+            self.preview.clear()
+
+    # -- copy -----------------------------------------------------------------
+    def copy_single(self, result: NoticeResult) -> None:
+        """Put the actual notice image on the Windows clipboard.
+
+        Real pixels, not a path or a filename: the point is that Ctrl+V in
+        Paint, Word or WhatsApp pastes the notice."""
+        from .utils import clipboard
+
+        try:
+            clipboard.set_image(bgr_to_pil(result.image_bgr))
+        except clipboard.ClipboardError as exc:
+            self._set_phase("Copy failed")
+            messagebox.showwarning("Copy image", str(exc))
+            return
+        except Exception:
+            run_logger.log("copy failed:\n" + traceback.format_exc(), "error")
+            messagebox.showwarning(
+                "Copy image", "The image could not be copied - see the log.")
+            return
+        self._set_phase(f"Copied notice {result.result_id} - press Ctrl+V "
+                        "to paste it")
+
+    # -- feedback -------------------------------------------------------------
+    def on_feedback(self, result: NoticeResult, verdict: str,
+                    origin: str = "results") -> None:
+        """Record what the user said, and act on it immediately.
+
+        The record is written before anything else: the click is the
+        evidence, and it has to survive even if the redraw below fails."""
+        from .utils import feedback as feedback_store
+
+        # A crop the user is judging must have been read, or the record
+        # carries no text and teaches nothing.  Cheap: one crop.
+        if not result.ocr_done:
+            engine = select_ocr_engine(_SilentReporter())
+            if engine is not None:
+                read_notice_crops([result], engine)
+
+        feedback_store.record(result, verdict, origin)
+        feedback_store.relearn()
+
+        if verdict == "negative":
+            result.rejected = True
+            result.needs_review = False
+        else:
+            result.needs_review = False       # confirmed - it belongs
+            result.demoted = False
+        apply_learning(self.gallery.all_results())
+        self.gallery.refresh_filters()
+        self._update_count()
+        positive, negative = feedback_store.counts()
+        self._set_phase(f"Thanks - learned from {positive + negative} "
+                        "correction(s)")
+
+    def _toggle_hidden(self) -> None:
+        """Show or hide what the learned model demoted.  The way back from a
+        wrong lesson without editing a file."""
+        self.gallery.show_hidden = bool(self.show_hidden_var.get())
+        self.gallery.refresh_filters()
+        self._update_count()
+
+    def open_review(self) -> None:
+        """The Not Sure queue.
+
+        One window, reused.  Opening a second copy would give two dialogs
+        working through the SAME queue, so answering in one leaves the other
+        showing a notice that has already been ruled on - and the QA button
+        sweep, which invokes every button twice, produces exactly that."""
+        existing = getattr(self, "_review_dialog", None)
+        if existing is not None:
+            try:
+                if existing.winfo_exists():
+                    existing.deiconify()
+                    existing.lift()
+                    existing.focus_set()
+                    return
+            except tk.TclError:
+                pass                      # it went away; build a fresh one
+        self._review_dialog = ReviewDialog(
+            self.root, self.gallery.review_results(),
+            lambda r, v: self.on_feedback(r, v, "review"), self._guj_ui_font)
 
     # -- preview & saving -----------------------------------------------------
     def show_in_preview(self, result: NoticeResult) -> None:
@@ -6980,7 +8792,10 @@ class Application(ttk.Frame):
         self._save_many(self.gallery.selected_results(), "selected")
 
     def save_all(self) -> None:
-        self._save_many(self.gallery.all_results(), "all")
+        # What is on screen, not what the run found: with a filter on, "all"
+        # can only honestly mean the notices the filter left.
+        self._save_many(self.gallery.visible_results(),
+                        "the shown" if self.gallery.is_filtered() else "all")
 
     def _save_many(self, results: List[NoticeResult], label: str) -> None:
         if not results:
@@ -7043,7 +8858,10 @@ class Application(ttk.Frame):
         # diagnostics the app wrote for itself go now.  The stored login is
         # deliberately kept (see config.PERSISTENT_NAMES).
         if config.CLEAR_DATA_ON_EXIT:
-            run_logger.close()
+            # final=True: a thread still winding down (a browser session, a
+            # cancelled agent) logging one more line would reopen the file
+            # and put data/logs back milliseconds after this deletes it.
+            run_logger.close(final=True)
             config.clear_run_data()
             # __pycache__ folders a test run or a tool left in the tree; the
             # launcher keeps normal runs from making them at all.

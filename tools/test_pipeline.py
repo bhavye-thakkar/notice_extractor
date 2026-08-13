@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import shutil
 import sys
 import threading
 import time
@@ -131,6 +132,97 @@ def test_reporter_streams_immediately():
     assert base.results[0].section_title == "GS - ahd - 10-08"
     assert len(reporter.collected) == 1, "count bookkeeping lost"
     print("ok  reporter streams each notice immediately")
+
+
+def test_agent_retries_transient_failures_but_never_credentials():
+    """The retry rule this file's own docstring has always claimed to cover.
+
+    Three separate promises in agents/processor.py:
+      * a transient failure is retried, and the run still produces notices,
+      * an AUTH: failure is NOT retried - a wrong password will still be
+        wrong the third time, and each attempt is a fresh browser launch,
+      * notices an agent published BEFORE it died are salvaged into the
+        total, or the summary says "3 notices" under a screen showing 57.
+    """
+    import queue as queue_mod
+    import threading as threading_mod
+
+    from notice_extractor.agents import processor
+
+    day = pne.date.today()
+
+    def run(extractor_cls):
+        reporter = pne.ProgressReporter(queue_mod.Queue(),
+                                        threading_mod.Event())
+        return processor.run_jobs(
+            [(extractor_cls, "ahmedabad", day, "https://example.test/1")],
+            reporter)
+
+    class _Flaky:
+        """Uses up every retry with transient errors, then works.
+
+        Driven off AGENT_RETRIES rather than a hardcoded count, so turning
+        the knob down to 0 fails this test loudly instead of quietly
+        weakening it."""
+        display_name = "Flaky Paper"
+        attempts = 0
+
+        def __init__(self, broad=False):
+            self.current_issue_date = ""
+
+        def extract_all(self, jobs, reporter, **kwargs):
+            type(self).attempts += 1
+            if type(self).attempts <= pne.AGENT_RETRIES:
+                raise pne.ExtractionError("connection reset by peer")
+            reporter.result(make_result(pne, "Flaky Paper", 3))
+
+    class _BadPassword:
+        """Fails with credentials, which must be believed the first time."""
+        display_name = "Locked Paper"
+        attempts = 0
+
+        def __init__(self, broad=False):
+            self.current_issue_date = ""
+
+        def extract_all(self, jobs, reporter, **kwargs):
+            type(self).attempts += 1
+            raise pne.ExtractionError("AUTH: sign-in required")
+
+    class _DiesAfterPublishing:
+        """Publishes two notices, then dies for good."""
+        display_name = "Half Paper"
+        attempts = 0
+
+        def __init__(self, broad=False):
+            self.current_issue_date = ""
+
+        def extract_all(self, jobs, reporter, **kwargs):
+            type(self).attempts += 1
+            reporter.result(make_result(pne, "Half Paper", 1))
+            reporter.result(make_result(pne, "Half Paper", 2))
+            raise pne.ExtractionError("stream closed mid-edition")
+
+    assert pne.AGENT_RETRIES >= 1, "no retries configured at all"
+    summary = run(_Flaky)
+    assert _Flaky.attempts == pne.AGENT_RETRIES + 1, \
+        f"retried {_Flaky.attempts - 1} of {pne.AGENT_RETRIES} time(s)"
+    assert summary.total == 1, summary.total
+    assert not summary.skipped, summary.skipped
+
+    summary = run(_BadPassword)
+    assert _BadPassword.attempts == 1, \
+        f"credentials retried {_BadPassword.attempts} times"
+    assert summary.total == 0 and summary.skipped
+
+    summary = run(_DiesAfterPublishing)
+    assert _DiesAfterPublishing.attempts == pne.AGENT_RETRIES + 1
+    # Published before it died - and published notices are on screen.
+    assert summary.total == 2, \
+        f"lost {2 - summary.total} notice(s) the user can see"
+    assert summary.per_paper.get("Half Paper") == 2, summary.per_paper
+    print(f"ok  agents retry transient failures ({pne.AGENT_RETRIES} "
+          f"retr{'y' if pne.AGENT_RETRIES == 1 else 'ies'}), never "
+          "credentials, and keep what they published")
 
 
 # ---------------------------------------------------------------------------
@@ -604,6 +696,12 @@ def test_status_log_pane_stays_visible():
 
     try:
         settle()
+        # It now starts CLOSED (see
+        # test_status_log_starts_closed_and_comes_back_whole); this test is
+        # about the width it comes back at, so open it first.
+        assert not app._log_visible, "the log opened by default"
+        app.toggle_log()
+        settle(0.8)
         assert app._log_visible
         first = app._paned.sashpos(0)
         assert first >= LOG_PANE_MIN_WIDTH, f"log pane opened at {first}px"
@@ -870,6 +968,1312 @@ def test_empty_hint_goes_away_when_a_notice_arrives():
     print("ok  empty-gallery hint clears as soon as a notice arrives")
 
 
+def test_empty_hint_is_actually_visible():
+    """The hint must be READABLE, not merely gridded.
+
+    winfo_manager() (the check above) says a geometry manager owns the
+    widget; it says nothing about whether you can see it.  The masonry pass
+    sizes the canvas window from the PLACED cards, so an empty gallery came
+    to gap+gap = 20 px and clipped the 109 px hint to a sliver.  The gallery
+    looked broken instead of empty, and every assertion in the codebase
+    still passed."""
+    previous_root = getattr(tk, "_default_root", None)
+    root = tk.Tk()
+    tk._default_root = root
+    root.geometry("900x600")
+    root.update()
+    try:
+        gallery = pne.GalleryPanel(root, on_open=lambda r: None,
+                                   on_save=lambda r: None,
+                                   on_click=lambda r: None)
+        gallery.pack(fill="both", expand=True)
+        for _ in range(40):
+            root.update()
+            time.sleep(0.005)
+        needed = gallery._empty_label.winfo_reqheight()
+        inner = gallery._inner.winfo_height()
+        assert gallery._empty_label.winfo_ismapped(), "hint is not mapped"
+        assert inner >= needed, \
+            f"hint is clipped: {inner}px of canvas for a {needed}px label"
+    finally:
+        root.destroy()
+        tk._default_root = previous_root
+    print(f"ok  empty-gallery hint is visible ({inner}px for a {needed}px "
+          "label)")
+
+
+def test_search_bar_hides_remove_until_there_is_something_to_remove():
+    """The default search UI is the word "Search" and somewhere to type.
+
+    Clear appears only once there is a query to clear, and the dropdown's
+    Clear-search-history row only exists while a history does.  A Remove
+    control with nothing to remove is clutter that also lies about state."""
+    from notice_extractor.utils import search as store
+
+    previous_root = getattr(tk, "_default_root", None)
+    root = tk.Tk()
+    tk._default_root = root
+    root.withdraw()
+    # The tests get their OWN history file.  Pointing them at the real
+    # data/recent_searches.json meant two of my own processes (this suite and
+    # qa_run.py) could clear and restore it at the same time - which produced
+    # exactly one phantom failure and sent me looking for a bug in the code.
+    saved_name = store.RECENT_FILENAME
+    store.RECENT_FILENAME = "test-recent-searches.json"
+    try:
+        store.clear_recent()
+        gallery = pne.GalleryPanel(root, on_open=lambda r: None,
+                                   on_save=lambda r: None,
+                                   on_click=lambda r: None)
+        bar = gallery.build_search_bar(root)
+        bar.pack()
+        root.update()
+
+        # winfo_manager(), not winfo_ismapped(): this root is withdrawn (and
+        # a real one can be minimised), which makes every child report "not
+        # mapped" whether or not it is packed.
+        assert not gallery._clear_btn.winfo_manager(), \
+            "Clear is on screen with nothing to clear"
+        assert list(gallery._search_combo.cget("values")) == [], \
+            "an empty history must not offer a Clear-history row"
+
+        gallery.search_var.set("public notice")
+        root.update()
+        assert gallery._clear_btn.winfo_manager(), \
+            "Clear stayed hidden even though there is a query"
+
+        gallery.search_var.set("")
+        root.update()
+        assert not gallery._clear_btn.winfo_manager(), \
+            "Clear stayed on screen after the query went"
+
+        # Minimise / restore must not desync it: while a window is iconified
+        # every child reads as unmapped, which is exactly the state an
+        # ismapped()-based check gets wrong.
+        gallery.search_var.set("land notice")
+        root.update()
+        root.deiconify()
+        root.iconify()
+        root.update()
+        gallery.search_var.set("")
+        root.update()
+        root.deiconify()
+        root.update()
+        assert not gallery._clear_btn.winfo_manager(), \
+            "Clear survived a minimise/restore with an empty query"
+    finally:
+        store.clear_recent()
+        store.RECENT_FILENAME = saved_name
+        root.destroy()
+        tk._default_root = previous_root
+    print("ok  search bar hides Clear until there is a query")
+
+
+def test_recent_search_history_round_trips_through_the_ui():
+    """Running a search records it; picking it back out RUNS it again.
+
+    The point of the list is not retyping a query you already ran, so a
+    dropdown that only fills the box would leave the manual step in place."""
+    from notice_extractor.utils import search as store
+
+    previous_root = getattr(tk, "_default_root", None)
+    root = tk.Tk()
+    tk._default_root = root
+    root.withdraw()
+    # The tests get their OWN history file.  Pointing them at the real
+    # data/recent_searches.json meant two of my own processes (this suite and
+    # qa_run.py) could clear and restore it at the same time - which produced
+    # exactly one phantom failure and sent me looking for a bug in the code.
+    saved_name = store.RECENT_FILENAME
+    store.RECENT_FILENAME = "test-recent-searches.json"
+    try:
+        store.clear_recent()
+        gallery = pne.GalleryPanel(root, on_open=lambda r: None,
+                                   on_save=lambda r: None,
+                                   on_click=lambda r: None)
+        gallery.build_search_bar(root).pack()
+        fired = []
+
+        def stub_search(query):
+            """What the Application really does: run it, then report back.
+
+            Reporting back matters - the bar refuses a second search while
+            one is in flight (the button's disabled state IS that flag), so
+            a stub that never finishes would wedge it after one query."""
+            fired.append(query)
+            gallery.search_finished(query, 0, 0)
+
+        gallery.on_search = stub_search
+        root.update()
+
+        for query in ("public notice", "જાહેર ચેતવણી", "property notice"):
+            gallery.search_var.set(query)
+            gallery._fire_search()
+        root.update()
+        assert fired == ["public notice", "જાહેર ચેતવણી",
+                         "property notice"], fired
+        # Newest first.
+        assert gallery.recent_searches() == [
+            "property notice", "જાહેર ચેતવણી", "public notice"], \
+            gallery.recent_searches()
+
+        # Same query, different case and spacing: one row, moved to the top.
+        gallery.search_var.set("PUBLIC   NOTICE")
+        gallery._fire_search()
+        root.update()
+        assert gallery.recent_searches() == [
+            "PUBLIC NOTICE", "property notice", "જાહેર ચેતવણી"], \
+            gallery.recent_searches()
+
+        # Picking a row applies it - no retyping, no second click.
+        fired.clear()
+        gallery.search_var.set("જાહેર ચેતવણી")
+        gallery._on_history_pick()
+        root.update()
+        assert fired == ["જાહેર ચેતવણી"], fired
+
+        # Removing one entry leaves the rest alone.
+        gallery._forget("property notice")
+        root.update()
+        assert "property notice" not in gallery.recent_searches()
+        assert len(gallery.recent_searches()) == 2
+
+        # The Clear-history row is an action, never a query.
+        fired.clear()
+        gallery.search_var.set(gallery.CLEAR_HISTORY_ROW)
+        gallery._on_history_pick()
+        root.update()
+        assert fired == [], "the Clear-history row was searched for"
+        assert gallery.recent_searches() == []
+        assert gallery.search_var.get() == "", \
+            "the action row's own label was left in the search box"
+    finally:
+        store.clear_recent()
+        store.RECENT_FILENAME = saved_name
+        root.destroy()
+        tk._default_root = previous_root
+    print("ok  recent searches: saved, deduped, re-applied on pick")
+
+
+def test_a_match_without_boxes_is_still_shown():
+    """A notice can match with NO word boxes - OCR glues the phrase into one
+    blob whose pieces no longer line up with the query - and search.py both
+    documents and tests that case.
+
+    The gallery used to read the verdict off `match_boxes`, so those notices
+    were counted in "3 of 40 contain X" and then hidden by "Show only
+    matches" and skipped by the jump-to-first-hit.  Counted but invisible."""
+    import numpy as np
+
+    previous_root = getattr(tk, "_default_root", None)
+    root = tk.Tk()
+    tk._default_root = root
+    root.withdraw()
+    try:
+        gallery = pne.GalleryPanel(root, on_open=lambda r: None,
+                                   on_save=lambda r: None,
+                                   on_click=lambda r: None)
+        gallery.build_search_bar(root)
+        gallery.pack()
+        gallery.add_heading("Sandesh  -  ahmedabad  -  12-08-2026")
+        glued = pne.NoticeResult(
+            result_id=1, page_number=4, index_on_page=1,
+            image_bgr=np.full((90, 70, 3), 240, np.uint8),
+            confidence=91, method="box+template", edition="ahmedabad",
+            newspaper="Sandesh", issue_date="2026-08-12",
+            section_title="Sandesh  -  ahmedabad  -  12-08-2026")
+        gallery.add_result(glued)
+        root.update()
+
+        # Exactly what start_search() writes for a boxless hit.
+        glued.matched = True
+        glued.match_boxes = []
+        glued.match_query_text = "જાહેર ચેતવણી"
+        gallery.search_var.set("જાહેર ચેતવણી")
+        gallery._refresh_after_search()
+        root.update()
+
+        assert gallery._visible_results(0) == [glued], \
+            "the search filter hid a notice the counter had just counted"
+        assert gallery.cards, "the matching notice has no card"
+        card = gallery.cards[0]
+        labels = [w.cget("text") for w in card.winfo_children()
+                  if w.winfo_class() == "TLabel"]
+        assert any("Matched:" in text and "જાહેર ચેતવણી" in text
+                   for text in labels), labels
+    finally:
+        root.destroy()
+        tk._default_root = previous_root
+    print("ok  a boxless match stays visible and says what it matched")
+
+
+def test_searching_filters_the_gallery_by_itself():
+    """A search narrows the gallery on its own.
+
+    There is no "Show only matches" box any more: asking for something and
+    then being shown everything, with the answer highlighted somewhere among
+    it, is not a search result.  Clear is the way back."""
+    import numpy as np
+
+    previous_root = getattr(tk, "_default_root", None)
+    root = tk.Tk()
+    tk._default_root = root
+    root.withdraw()
+    try:
+        gallery = pne.GalleryPanel(root, on_open=lambda r: None,
+                                   on_save=lambda r: None,
+                                   on_click=lambda r: None)
+        gallery.build_search_bar(root)
+        gallery.pack()
+        gallery.add_heading("Sandesh  -  ahmedabad  -  12-08-2026")
+        made = []
+        for index in range(4):
+            result = pne.NoticeResult(
+                result_id=index + 1, page_number=index + 1, index_on_page=1,
+                image_bgr=np.full((80, 60, 3), 240, np.uint8),
+                confidence=90, method="box+template", edition="ahmedabad",
+                newspaper="Sandesh", issue_date="2026-08-12",
+                section_title="Sandesh  -  ahmedabad  -  12-08-2026")
+            gallery.add_result(result)
+            made.append(result)
+        root.update()
+        assert len(gallery._visible_results(0)) == 4
+
+        # Two of them match - no checkbox is touched anywhere below.
+        for result in made[:2]:
+            result.matched = True
+            result.match_query_text = "જાહેર ચેતવણી"
+        gallery.search_var.set("જાહેર ચેતવણી")
+        gallery.search_finished("જાહેર ચેતવણી", 2, 4)
+        root.update()
+        assert gallery._visible_results(0) == made[:2], \
+            "the gallery still shows notices that did not match"
+        assert len(gallery.cards) == 2, f"{len(gallery.cards)} cards drawn"
+
+        # Nothing matches -> say so, and say how to get back.
+        for result in made:
+            result.matched = False
+        gallery.search_var.set("zebra")
+        gallery.search_finished("zebra", 0, 4)
+        root.update()
+        assert not gallery.cards, "cards drawn for a search with no matches"
+        hint = gallery._empty_label.cget("text")
+        assert "zebra" in hint and "Clear" in hint, hint
+        assert gallery._empty_label.winfo_manager(), "no empty state shown"
+
+        # Clear brings everything back.
+        gallery.clear_search()
+        root.update()
+        assert len(gallery._visible_results(0)) == 4, "Clear did not restore"
+    finally:
+        root.destroy()
+        tk._default_root = previous_root
+    print("ok  a search filters the gallery on its own, Clear restores it")
+
+
+def test_notice_type_click_filters_what_is_on_screen():
+    """Clicking a Notice-type button filters the notices already found.
+
+    It used to only change what the NEXT run would extract, so with a full
+    gallery on screen the click did nothing visible - which is the same
+    complaint that turned the dropdown into buttons in the first place.
+
+    The filter is STRICT: an unidentified notice does not match a specific
+    type.  Letting unknowns through was the first design, and on real
+    newsprint 29% of crops came back unknown - so "show me જાહેર ચેતવણી"
+    answered with a screen of જાહેર નોટિસ.  They are counted and reported
+    instead, and "All" still shows everything."""
+    import numpy as np
+
+    previous_root = getattr(tk, "_default_root", None)
+    root = tk.Tk()
+    tk._default_root = root
+    root.withdraw()
+    was = pne.active_notice_type()
+    try:
+        gallery = pne.GalleryPanel(root, on_open=lambda r: None,
+                                   on_save=lambda r: None,
+                                   on_click=lambda r: None)
+        gallery.build_search_bar(root)
+        gallery.pack()
+        gallery.add_heading("Sandesh  -  ahmedabad  -  12-08-2026")
+        kinds = ["notice", "notice", "chetavni", ""]
+        made = []
+        for index, kind in enumerate(kinds):
+            result = pne.NoticeResult(
+                result_id=index + 1, page_number=index + 1, index_on_page=1,
+                image_bgr=np.full((80, 60, 3), 240, np.uint8),
+                confidence=90, method="box+template", edition="ahmedabad",
+                newspaper="Sandesh", issue_date="2026-08-12",
+                section_title="Sandesh  -  ahmedabad  -  12-08-2026")
+            result.notice_type = kind
+            result.ocr_done = True
+            gallery.add_result(result)
+            made.append(result)
+        root.update()
+
+        pne.set_notice_type("All")
+        gallery.apply_type_filter()
+        root.update()
+        assert len(gallery._visible_results(0)) == 4, "All must show all 4"
+
+        pne.set_notice_type("જાહેર ચેતવણી")
+        gallery.apply_type_filter()
+        root.update()
+        shown = gallery._visible_results(0)
+        assert shown == [made[2]], \
+            f"ચેતવણી filter should show only the ચેતવણી notice, got {shown}"
+        assert made[3] not in shown, \
+            "an unidentified notice matched a specific type filter"
+        assert len(gallery.cards) == 1, f"{len(gallery.cards)} cards drawn"
+        assert gallery.unidentified_count() == 1, \
+            "the unidentified notice must be counted, not just dropped"
+
+        pne.set_notice_type("જાહેર નોટિસ")
+        gallery.apply_type_filter()
+        root.update()
+        shown = gallery._visible_results(0)
+        assert shown == made[:2], f"નોટિસ filter showed {shown}"
+        assert made[2] not in shown, "a ચેતવણી survived the નોટિસ filter"
+        assert made[3] not in shown, "an unidentified notice slipped through"
+
+        pne.set_notice_type("All")
+        gallery.apply_type_filter()
+        root.update()
+        assert len(gallery._visible_results(0)) == 4, "All did not restore"
+    finally:
+        pne.set_notice_type({"notice": "જાહેર નોટિસ",
+                             "chetavni": "જાહેર ચેતવણી"}.get(was, "All"))
+        root.destroy()
+        tk._default_root = previous_root
+    print("ok  notice-type buttons filter the gallery on click")
+
+
+def test_saving_and_counting_follow_the_filter():
+    """"Save All" must mean the notices you are looking at.
+
+    Filtering to જાહેર ચેતવણી, pressing Save All and getting back the
+    notices you just filtered out is the same class of bug as counting a
+    match and then refusing to show it."""
+    import numpy as np
+
+    previous_root = getattr(tk, "_default_root", None)
+    root = tk.Tk()
+    tk._default_root = root
+    root.withdraw()
+    was = pne.active_notice_type()
+    try:
+        gallery = pne.GalleryPanel(root, on_open=lambda r: None,
+                                   on_save=lambda r: None,
+                                   on_click=lambda r: None)
+        gallery.build_search_bar(root)
+        gallery.pack()
+        gallery.add_heading("Sandesh  -  ahmedabad  -  12-08-2026")
+        made = []
+        for index, kind in enumerate(["notice", "notice", "chetavni"]):
+            result = pne.NoticeResult(
+                result_id=index + 1, page_number=index + 1, index_on_page=1,
+                image_bgr=np.full((80, 60, 3), 240, np.uint8),
+                confidence=90, method="box+template", edition="ahmedabad",
+                newspaper="Sandesh", issue_date="2026-08-12",
+                section_title="Sandesh  -  ahmedabad  -  12-08-2026")
+            result.notice_type = kind
+            result.ocr_done = True
+            gallery.add_result(result)
+            made.append(result)
+        root.update()
+
+        pne.set_notice_type("All")
+        gallery.apply_type_filter()
+        root.update()
+        assert not gallery.is_filtered()
+        assert len(gallery.visible_results()) == 3
+        assert len(gallery.selected_results()) == 3
+
+        pne.set_notice_type("જાહેર ચેતવણી")
+        gallery.apply_type_filter()
+        root.update()
+        assert gallery.is_filtered()
+        assert gallery.visible_results() == [made[2]], \
+            "Save All would have written the filtered-out notices"
+        assert gallery.selected_results() == [made[2]]
+        # ...while the run's full set is still reachable, or a search could
+        # never find anything the type buttons are currently hiding.
+        assert len(gallery.all_results()) == 3
+
+        # A search narrows on top of the type filter, not instead of it.
+        made[2].matched = False
+        made[0].matched = True
+        gallery.search_var.set("public notice")
+        gallery._refresh_after_search()
+        root.update()
+        assert gallery.visible_results() == [], \
+            "the two filters must compose, not replace each other"
+    finally:
+        pne.set_notice_type({"notice": "જાહેર નોટિસ",
+                             "chetavni": "જાહેર ચેતવણી"}.get(was, "All"))
+        root.destroy()
+        tk._default_root = previous_root
+    print("ok  saving and counting follow the filter, and filters compose")
+
+
+def test_a_late_log_line_cannot_undo_the_shutdown_wipe():
+    """Quitting deletes data/logs.  A thread still winding down must not put
+    it straight back.
+
+    log() calls log_path(), and log_path() recreates the folder on demand -
+    so a browser session or a cancelled agent writing one more line after
+    clear_run_data() resurrected exactly what shutdown had just removed.
+    Caught by a live QA run that took 249 s: on a slow, loaded machine the
+    teardown threads were still going when the window closed."""
+    import shutil
+    import tempfile
+
+    from notice_extractor import config
+    from notice_extractor.utils import logger as run_logger
+
+    # A private log folder, NOT data/logs.  The real one can legitimately be
+    # held open by a second copy of the app (config.clear_run_data() says so
+    # itself), and this test is about the reopen race, not about whether
+    # Windows will let us win a fight with another process.
+    real_dir = config.LOG_DIR
+    temp_dir = tempfile.mkdtemp(prefix="pne-logtest-")
+    try:
+        config.LOG_DIR = temp_dir
+        run_logger.reopen()
+        run_logger.close()
+        run_logger.log("before the quit", "info")
+        run_logger.flush()
+        assert os.listdir(temp_dir), "the log file was never written"
+
+        # What Application._on_close() does, in order.
+        run_logger.close(final=True)
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        assert not os.path.isdir(temp_dir), "the log folder did not go"
+
+        # ...and now the straggler: a browser session or a cancelled agent
+        # writing one more line after the wipe.
+        run_logger.log("a browser session winding down", "dim")
+        run_logger.log("a cancelled agent", "warn")
+        assert not os.path.isdir(temp_dir), \
+            "a late log line recreated the log folder after shutdown wiped it"
+
+        # Logging comes back for the next run, not stuck off forever.
+        run_logger.reopen()
+        run_logger.log("a new run", "info")
+        assert os.path.isdir(temp_dir), "logging never recovered"
+    finally:
+        run_logger.reopen()
+        run_logger.close()
+        config.LOG_DIR = real_dir
+        shutil.rmtree(temp_dir, ignore_errors=True)
+    print("ok  a late log line cannot undo the shutdown wipe")
+
+
+def test_a_new_run_unsticks_a_background_read():
+    """Starting a run must not wedge search and the notice-type filter.
+
+    _begin_run swaps in a FRESH message queue so a cancelled worker's late
+    messages cannot reach the UI.  A background crop read (Find-text, or a
+    Notice-type click) captured the OLD queue when it started, so the "done"
+    message that clears `_searching` lands somewhere nothing drains.  Left
+    set, that flag makes start_search return early FOREVER: every later
+    search and every notice-type click is silently refused, and the Search
+    button - disabled awaiting a reply that can never arrive - stays dead.
+
+    This is what hung a live QA run for nine minutes with no error."""
+    previous_root = getattr(tk, "_default_root", None)
+    root = tk.Tk()
+    tk._default_root = root
+    root.withdraw()
+    try:
+        app = pne.Application(root)
+        root.update()
+
+        # Exactly the state a background read leaves behind.
+        orphaned = app._msg_queue
+        app._searching = True
+        app.gallery._search_btn.configure(state="disabled")
+        app.gallery.search_var.set("જાહેર ચેતવણી")
+        root.update()
+
+        app._begin_run()
+        root.update()
+        assert app._msg_queue is not orphaned, "the queue was not replaced"
+        assert not app._searching, \
+            "_searching survived the queue swap - every later search is dead"
+        assert "disabled" not in app.gallery._search_btn.state(), \
+            "the Search button stayed disabled awaiting a lost reply"
+        assert app.gallery.search_var.get() == "", \
+            "a stale query would hide the whole new run behind 'no match'"
+
+        # And the app is genuinely usable again.
+        fired = []
+        app.gallery.on_search = lambda q: (fired.append(q),
+                                           app.gallery.search_finished(q, 0, 0))
+        app.gallery.search_var.set("public notice")
+        app.gallery._fire_search()
+        root.update()
+        assert fired == ["public notice"], fired
+    finally:
+        app._running = False
+        root.destroy()
+        tk._default_root = previous_root
+    print("ok  a new run un-sticks a background read (search stays alive)")
+
+
+def _feedback_result(pne, text="", confidence=70, review=False, rid=1):
+    import numpy as np
+    result = pne.NoticeResult(
+        result_id=rid, page_number=4, index_on_page=1,
+        image_bgr=np.full((80, 60, 3), 240, np.uint8),
+        confidence=confidence, method="box+template", edition="ahmedabad",
+        newspaper="Gujarat Samachar", issue_date="2026-08-12",
+        section_title="Gujarat Samachar  -  ahmedabad  -  12-08-2026")
+    result.ocr_text = text
+    result.normalized_ocr = pne.normalize_ocr_text(text)
+    result.ocr_done = bool(text)
+    result.notice_type = "notice"
+    result.needs_review = review
+    return result
+
+
+def test_one_bad_message_does_not_kill_the_pump():
+    """_poll_queue is the only bridge from the workers to the window.
+
+    It used to reschedule itself on the last line of the happy path, so a
+    single exception out of a handler skipped the reschedule and killed it
+    permanently: the window stayed up, the run kept going, and nothing it
+    produced ever reached the screen again.  `_searching` stuck true forever
+    because the message that clears it could no longer be delivered, and the
+    only visible symptom was a search timing out after two minutes."""
+    previous_root = getattr(tk, "_default_root", None)
+    root = tk.Tk()
+    tk._default_root = root
+    root.withdraw()
+    try:
+        app = pne.Application(root)
+        root.update()
+
+        seen = []
+        original = app._handle_message
+
+        def explode(message):
+            if message[0] == "boom":
+                raise RuntimeError("handler blew up")
+            seen.append(message[0])
+            return original(message)
+
+        app._handle_message = explode
+        app._msg_queue.put(("boom",))
+        app._msg_queue.put(("log", "after the explosion", "info"))
+        for _ in range(40):
+            root.update()
+            time.sleep(0.01)
+
+        assert "log" in seen, \
+            "the pump died on a bad message - nothing after it was delivered"
+
+        # ...and it is still alive several messages later.
+        app._msg_queue.put(("log", "still pumping", "info"))
+        for _ in range(30):
+            root.update()
+            time.sleep(0.01)
+        assert seen.count("log") >= 2, seen
+    finally:
+        app._running = False
+        root.destroy()
+        tk._default_root = previous_root
+    print("ok  one bad message is logged and skipped; the pump survives")
+
+
+def test_normal_cards_ask_one_question_only():
+    """A result card offers "Not Related" and NOTHING else.
+
+    The notice is in the results because the app already believes it
+    belongs, so the only useful question left is whether it got that wrong.
+    "This Is Right" on every card would make the common case - the app was
+    right, say nothing - into a decision on every notice.  That button
+    exists in exactly one place, the Not Sure queue, where the app genuinely
+    does not know."""
+    previous_root = getattr(tk, "_default_root", None)
+    root = tk.Tk()
+    tk._default_root = root
+    root.withdraw()
+    try:
+        seen = []
+        card = pne.NoticeCard(root, _feedback_result(pne),
+                              on_open=lambda r: None, on_save=lambda r: None,
+                              on_click=lambda r: None,
+                              on_copy=lambda r: seen.append("copy"),
+                              on_feedback=lambda r, v: seen.append(v))
+        root.update()
+
+        labels = []
+        def walk(w):
+            for child in w.winfo_children():
+                try:
+                    text = str(child.cget("text"))
+                except Exception:
+                    text = ""
+                if child.winfo_class() in ("TButton", "Button") and text:
+                    labels.append(text)
+                walk(child)
+        walk(card)
+
+        assert any("Not Related" in t for t in labels), labels
+        for banned in ("This Is Right", "Not Sure", "I Need This",
+                       "I Don't Need This", "Maybe"):
+            assert not any(banned in t for t in labels), \
+                f"{banned!r} must not appear on a normal result card: {labels}"
+        for wanted in ("Open", "Save", "Copy"):
+            assert any(t == wanted for t in labels), \
+                f"the {wanted} button is missing: {labels}"
+
+        # The buttons actually call back.
+        for label in labels:
+            if label == "Copy" or "Not Related" in label:
+                for child in _all_children(card):
+                    try:
+                        if str(child.cget("text")) == label:
+                            child.invoke()
+                            break
+                    except Exception:
+                        continue
+        assert "copy" in seen and "negative" in seen, seen
+    finally:
+        root.destroy()
+        tk._default_root = previous_root
+    print(f"ok  normal card offers {sorted(set(labels))} - no confirm button")
+
+
+def _all_children(widget):
+    out = []
+    for child in widget.winfo_children():
+        out.append(child)
+        out.extend(_all_children(child))
+    return out
+
+
+def test_review_queue_is_the_only_place_you_confirm():
+    """The Not Sure queue carries BOTH buttons, and records both verdicts."""
+    import tempfile
+    from notice_extractor import config
+    from notice_extractor.utils import feedback as fb
+
+    previous_root = getattr(tk, "_default_root", None)
+    root = tk.Tk()
+    tk._default_root = root
+    root.withdraw()
+    folder = tempfile.mkdtemp(prefix="pne-review-")
+    original = config.DATA_DIR
+    config.DATA_DIR = folder
+    try:
+        verdicts = []
+        queue = [_feedback_result(pne, "advertisement circus tickets",
+                                  review=True, rid=1),
+                 _feedback_result(pne, "આથી જાહેર જનતાને જણાવવાનું",
+                                  review=True, rid=2)]
+        dialog = pne.ReviewDialog(root, queue,
+                                  lambda r, v: verdicts.append((r.result_id, v)),
+                                  "Segoe UI")
+        root.update()
+        labels = [str(c.cget("text")) for c in _all_children(dialog)
+                  if c.winfo_class() in ("TButton", "Button")]
+        assert any("This Is Right" in t for t in labels), labels
+        assert any("Not Related" in t for t in labels), labels
+
+        dialog._decide("negative")
+        root.update()
+        dialog._decide("positive")
+        root.update()
+        assert verdicts == [(1, "negative"), (2, "positive")], verdicts
+        # The queue empties and the buttons go quiet rather than acting on
+        # nothing.
+        assert dialog._current() is None
+        assert "disabled" in dialog._right_btn.state()
+        dialog.destroy()
+    finally:
+        config.DATA_DIR = original
+        root.destroy()
+        tk._default_root = previous_root
+        shutil.rmtree(folder, ignore_errors=True)
+    print("ok  review queue confirms and rejects; both are recorded")
+
+
+def test_learning_needs_repetition_and_protects_recall():
+    """Feedback has to change future runs - without eating real notices."""
+    import tempfile
+    from notice_extractor import config
+    from notice_extractor.utils import feedback as fb
+
+    folder = tempfile.mkdtemp(prefix="pne-learn-")
+    original = config.DATA_DIR
+    config.DATA_DIR = folder
+    try:
+        advert = "ASIAD CIRCUS tickets available bookmyshow evening show"
+        notice = "આથી જાહેર જનતાને જણાવવાનું કે સદરહુ મિલકત અંગે હક્ક હિસ્સો"
+
+        one = _feedback_result(pne, advert, confidence=70)
+        fb.record(one, "negative")
+        fb.relearn()
+        assert not fb.load_model()["weights"], "one click became a rule"
+
+        for i in range(fb.MIN_SUPPORT):
+            fb.record(_feedback_result(pne, advert + f" hall {i}"), "negative")
+        fb.relearn()
+        model = fb.load_model()
+        assert model["weights"], "repetition taught nothing"
+
+        # Generalises to a DIFFERENT advert sharing wording...
+        similar = _feedback_result(pne, "ASIAD CIRCUS tickets on bookmyshow",
+                                   confidence=70)
+        assert fb.should_demote(similar, model), "learned nothing reusable"
+        # ...but a real notice is untouched.
+        real = _feedback_result(pne, notice, confidence=70)
+        assert not fb.should_demote(real, model), "a real notice was demoted"
+        # ...and a confident detection is never demoted, whatever it says.
+        loud = _feedback_result(pne, advert + " hall 1", confidence=95)
+        assert not fb.should_demote(loud, model), \
+            "learning overruled a confident template match"
+
+        # apply_learning only ever sets `demoted`, never `rejected`.
+        results = [similar, real, loud]
+        pne.apply_learning(results)
+        assert similar.demoted and not similar.rejected
+        assert not real.demoted and not loud.demoted
+
+        # Versioned, and revertible.
+        before = fb.load_model()["version"]
+        fb.relearn()
+        assert fb.load_model()["version"] == before + 1
+        assert fb.rollback() is not None
+        positive, negative = fb.counts()
+        assert (positive, negative) == (0, fb.MIN_SUPPORT + 1)
+    finally:
+        config.DATA_DIR = original
+        shutil.rmtree(folder, ignore_errors=True)
+    print("ok  learning needs repetition, generalises, and cannot eat a "
+          "confident notice")
+
+
+def test_short_negative_keywords_do_not_veto_on_a_name():
+    """A 4-letter veto keyword must not match a person's name.
+
+    NEGATIVE_FUZZY_RATIO is 0.84.  On a 4-character word that is 3 characters
+    right and the fourth free - so "ભરતી" (recruitment) matched at 0.857
+    inside "ઘરતીબેન", a woman's name, and vetoed a real City Civil Court
+    notice on page 15 of a real edition.  The notice cleared every other
+    test in the pipeline and was thrown away on a name.
+
+    utils.search has had the same rule for query tokens since it was written
+    (FUZZY_MIN_TOKEN_LEN); the keyword matchers never got it."""
+    # The exact text that lost a notice.
+    lost = "આંક-૦૭ અરજદાર - દેસાઈ ઘરતીબેન કીરીટભાઈ તે ભાવીનભાઈ અશ્વિનભાઈ"
+    ratio, keyword = pne.match_negative_text(lost)
+    assert ratio == 0.0, \
+        f"a name still trips the veto: {keyword!r} at {ratio:.3f}"
+
+    # Every short keyword must be exact-only, so no near-miss can veto.
+    short = [k for k in pne.NEGATIVE_KEYWORDS
+             if len(pne.normalize_ocr_text(k)) < pne.FUZZY_MIN_KEYWORD_LEN]
+    assert short, "no short negative keywords - has the list changed?"
+    for keyword in short:
+        near = pne.normalize_ocr_text(keyword)
+        # swap the first character: one wrong letter out of four
+        mutated = ("ઘ" if near[0] != "ઘ" else "ખ") + near[1:]
+        assert pne.match_negative_text(mutated)[0] == 0.0, \
+            f"{keyword!r} still fuzzy-matches {mutated!r}"
+
+    # ...while the real thing is still vetoed, which is the whole point.
+    for text, expect in (
+            ("ભરતી જાહેરાત માટે અરજી મંગાવવામાં આવે છે", True),
+            ("ઈ-ટેન્ડર નોટિસ પ્રસિદ્ધ કરવામાં આવે છે", True),
+            ("જાહેર હરાજી થી વેચાણ કરવાનું છે", True),
+            ("કબજા નોટિસ સ્થાવર મિલકત", True),
+            ("આથી જાહેર જનતાને જણાવવાનું કે", False)):
+        got = pne.match_negative_text(text)[0] > 0
+        assert got is expect, f"{text[:30]!r} -> {got}, wanted {expect}"
+    print(f"ok  short negative keywords are exact-only "
+          f"({len(short)} of them), real vetoes still fire")
+
+
+def test_status_log_starts_closed_and_comes_back_whole():
+    """The log is a diagnostic, not the point of the screen.
+
+    It opened by default and took a third of the window from the notices.
+    Closed now - but it must keep recording while hidden and come back at a
+    real width, which is the bug ui/app.py was written to fix."""
+    previous_root = getattr(tk, "_default_root", None)
+    root = tk.Tk()
+    tk._default_root = root
+    root.geometry("1300x800")
+    root.update()
+    try:
+        app = pne.Application(root)
+        for _ in range(60):
+            root.update()
+            time.sleep(0.005)
+
+        assert not app._log_visible, "the log opened by default again"
+        assert not app.log_panel.winfo_ismapped(), "the log pane is on screen"
+        assert app._show_log_btn.winfo_manager(), \
+            "no way back in - the ☰ Log button is not shown"
+
+        # It records while hidden, or closing it would lose the run's log.
+        app.log_panel.log("recorded while the panel was closed", "info")
+        for _ in range(30):
+            root.update()
+            time.sleep(0.005)
+
+        app.toggle_log()
+        for _ in range(60):
+            root.update()
+            time.sleep(0.005)
+        assert app._log_visible and app.log_panel.winfo_ismapped()
+        assert app.log_panel.winfo_width() >= pne.LOG_PANE_MIN_WIDTH, \
+            f"reopened at {app.log_panel.winfo_width()}px"
+        shown = app.log_panel._text.get("1.0", "end")
+        assert "recorded while the panel was closed" in shown, \
+            "lines logged while hidden were lost"
+
+        app.toggle_log()
+        for _ in range(30):
+            root.update()
+            time.sleep(0.005)
+        assert not app._log_visible
+        assert app._show_log_btn.winfo_manager(), "the ☰ Log button vanished"
+    finally:
+        app._running = False
+        root.destroy()
+        tk._default_root = previous_root
+    print("ok  status log starts closed, keeps recording, reopens whole")
+
+
+def test_help_guide_opens_without_breaking_scrolling():
+    """Help > How to use this app is a real guide, and must not cost the
+    app its mouse wheel.
+
+    The obvious way to scroll a dialog is bind_all("<MouseWheel>") - which
+    REPLACES the Application's own global wheel handler, and unbinding it on
+    close then leaves the gallery unscrollable."""
+    previous_root = getattr(tk, "_default_root", None)
+    root = tk.Tk()
+    tk._default_root = root
+    root.geometry("1200x760")
+    root.update()
+    try:
+        app = pne.Application(root)
+        root.update()
+        before = root.bind_all("<MouseWheel>")
+        assert before, "the app never installed its global wheel handler"
+
+        app._show_help()
+        for _ in range(40):
+            root.update()
+            time.sleep(0.005)
+        dialogs = [w for w in root.winfo_children()
+                   if isinstance(w, pne.HelpDialog)]
+        assert dialogs, "Help > How to use this app opened nothing"
+        dialog = dialogs[0]
+
+        # It has to actually say something, in order.
+        assert len(pne.HELP_STEPS) >= 6, "the guide is a stub"
+        steps = sum(len(s) for _h, s in pne.HELP_STEPS)
+        assert steps >= 20, f"only {steps} steps"
+        headings = [h for h, _s in pne.HELP_STEPS]
+        assert headings[0].startswith("1."), headings[0]
+        # The things a first-time user has to be told.
+        joined = " ".join(h + " " + " ".join(s) for h, s in pne.HELP_STEPS)
+        for word in ("Extract", "Save", "Search", "જાહેર ચેતવણી",
+                     "Downloads & Setup", "Cancel"):
+            assert word in joined, f"the guide never mentions {word!r}"
+
+        dialog.destroy()
+        root.update()
+        assert root.bind_all("<MouseWheel>") == before, \
+            "closing Help took the app's global wheel binding with it"
+    finally:
+        app._running = False
+        root.destroy()
+        tk._default_root = previous_root
+    print(f"ok  help guide: {len(pne.HELP_STEPS)} sections, {steps} steps, "
+          "wheel binding intact")
+
+
+def test_the_ocr_header_test_reads_a_shallower_band():
+    """The text test for "is there a header here?" must look at a shallower
+    band than template matching does.
+
+    At 32% of the box it read a third of the way down, and Gujarati notices
+    close with "આ જાહેર નોટીસથી જાહેર જનતાને નોંધ લેવા વિનંતી" - so a
+    continuation column with no header of its own matched on its own body
+    text and was cropped as a notice.  Measured over 46 real crops: genuine
+    headers sit at 1-3% of the box, the false matches at 25% and 27%."""
+    import numpy as np
+
+    cfg = pne.DetectionConfig()
+    assert cfg.ocr_header_frac < cfg.strip_frac_of_box, \
+        "the OCR band is not shallower than the template band"
+    assert cfg.ocr_header_frac <= 0.22, \
+        f"{cfg.ocr_header_frac} still reaches the body text at 25%"
+    assert cfg.ocr_header_frac >= 0.10, \
+        f"{cfg.ocr_header_frac} is tighter than the headers it must contain"
+
+    class _Pipeline(pne.NoticeDetectionPipeline):
+        def __init__(self):
+            self._cfg = cfg
+
+    page = np.zeros((900, 700), np.uint8)
+    box = (50, 100, 300, 500)            # a 500px-tall notice
+    wide = _Pipeline()._header_strip(page, box)
+    narrow = _Pipeline()._header_strip(page, box, cfg.ocr_header_frac)
+    assert narrow.shape[0] < wide.shape[0], \
+        f"the OCR band ({narrow.shape[0]}px) is not shorter than the " \
+        f"template band ({wide.shape[0]}px)"
+    # A header at 3% of the box is inside it; body text at 25% is not.
+    assert narrow.shape[0] > 500 * 0.03, "a real header would be cut off"
+    assert narrow.shape[0] < 500 * 0.25, "body text is still included"
+    print(f"ok  OCR header band is {narrow.shape[0]}px of a 500px box "
+          f"(template band {wide.shape[0]}px)")
+
+
+def test_the_preview_drops_a_notice_the_filter_hid():
+    """Filtering must not leave the preview showing what it just hid.
+
+    The gallery emptied correctly when you clicked જાહેર ચેતવણી - and the
+    biggest image on screen carried on showing a જાહેર નોટિસ, because the
+    preview keeps whatever was last clicked.  The two panels disagreed, and
+    the one the eye goes to was the wrong one."""
+    import numpy as np
+
+    previous_root = getattr(tk, "_default_root", None)
+    root = tk.Tk()
+    tk._default_root = root
+    root.withdraw()
+    was = pne.active_notice_type()
+    try:
+        app = pne.Application(root)
+        root.update()
+        pne.set_notice_type("All")
+
+        made = []
+        for index, kind in enumerate(("notice", "notice", "chetavni")):
+            result = pne.NoticeResult(
+                result_id=index + 1, page_number=index + 1, index_on_page=1,
+                image_bgr=np.full((90, 70, 3), 240, np.uint8),
+                confidence=90, method="box+template", edition="ahmedabad",
+                newspaper="Sandesh", issue_date="2026-08-12",
+                section_title="Sandesh  -  ahmedabad  -  12-08-2026")
+            result.notice_type = kind
+            result.ocr_done = True
+            app.gallery.add_result(result)
+            made.append(result)
+        root.update()
+
+        # Looking at a નોટિસ, then filtering to ચેતવણી.
+        app.show_in_preview(made[0])
+        root.update()
+        assert app.preview._result is made[0]
+
+        pne.set_notice_type("જાહેર ચેતવણી")
+        app.gallery.apply_type_filter()
+        root.update()
+        assert app.preview._result is made[2], \
+            "the preview kept a જાહેર નોટિસ while the filter said ચેતવણી"
+
+        # Nothing survives the filter -> the preview empties rather than
+        # lying about what is on screen.
+        made[2].notice_type = "notice"
+        app.gallery.apply_type_filter()
+        root.update()
+        assert app.gallery.visible_results() == []
+        assert app.preview._result is None, "the preview outlived every notice"
+
+        # Back to All: the preview is left alone, nothing is being hidden.
+        pne.set_notice_type("All")
+        app.gallery.apply_type_filter()
+        root.update()
+        assert len(app.gallery.visible_results()) == 3
+    finally:
+        pne.set_notice_type({"notice": "જાહેર નોટિસ",
+                             "chetavni": "જાહેર ચેતવણી"}.get(was, "All"))
+        app._running = False
+        root.destroy()
+        tk._default_root = previous_root
+    print("ok  the preview drops a notice the filter hid")
+
+
+def test_recording_the_header_family_changes_no_detection():
+    """strip_score() now also records WHICH template won.  That must be a
+    pure observation: the score it returns, and therefore every detection
+    decision made from it, has to be bit-identical to the old loop."""
+    import random
+
+    import numpy as np
+
+    class _Verifier(pne.HeaderTemplateVerifier):
+        def __init__(self, templates):
+            # No __init__: template building needs fonts, a reporter and a
+            # config.  This test is only about the max-vs-argmax rewrite.
+            self.templates = templates
+            self._cfg = pne.DetectionConfig()
+            self.last_strip_family = ""
+
+    def old_strip_score(verifier, strip):
+        """The loop this replaced."""
+        if strip.size == 0 or not verifier.templates:
+            return 0.0
+        best = 0.0
+        for _label, template in verifier.templates:
+            best = max(best, verifier._match_one(
+                strip, template, verifier._cfg.strip_scales))
+        return best
+
+    random.seed(23)
+    rng = np.random.default_rng(23)
+    templates = [(f"gs-{i}", rng.integers(0, 255, (24, 90), dtype=np.uint8))
+                 for i in range(3)]
+    templates += [(f"chetavni-{i}",
+                   rng.integers(0, 255, (24, 90), dtype=np.uint8))
+                  for i in range(2)]
+    verifier = _Verifier(templates)
+
+    checked = 0
+    for _ in range(60):
+        h = random.randint(30, 70)
+        w = random.randint(120, 260)
+        strip = rng.integers(0, 255, (h, w), dtype=np.uint8)
+        new = verifier.strip_score(strip)
+        old = old_strip_score(verifier, strip)
+        assert new == old, f"score moved: {old} -> {new}"
+        # And the family it recorded is one it could actually have matched.
+        assert verifier.last_strip_family in ("notice", "chetavni", "")
+        checked += 1
+    assert verifier.strip_score(np.zeros((0, 0), np.uint8)) == 0.0
+    print(f"ok  recording the header family changed no score ({checked} strips)")
+
+
+def test_the_header_family_reaches_the_notice():
+    """The type read off the header strip must survive all the way to the
+    NoticeResult, including through a split box.
+
+    This is the path that matters: 11 of 13 crops that the crop-level
+    classifier could not label had a perfectly legible header - psm 11 just
+    drops a big isolated title line.  Detection had already read it."""
+    det = pne.Detection((10, 10, 200, 300), 0.91, "box+ocr", "chetavni")
+    assert det.family == "chetavni"
+    assert pne.Detection((0, 0, 1, 1), 0.5, "box+template").family == "", \
+        "family must default to unknown, not to a guess"
+
+    for keyword, expected in (
+            ("જાહેર નોટિસ", "notice"),
+            ("જાહેર નોટીસ", "notice"),
+            ("public notice", "notice"),
+            ("જાહેર ચેતવણી", "chetavni"),
+            ("જાહેરચેતવણી", "chetavni"),
+            ("public warning", "chetavni"),
+            ("jaher chetavni", "chetavni"),
+            ("", "")):
+        got = pne.family_of_keyword(keyword)
+        assert got == expected, f"{keyword!r} -> {got!r}, wanted {expected!r}"
+
+    # Detection's answer wins over the crop's, and is not overwritten by it.
+    import numpy as np
+
+    def fresh(notice_type):
+        r = pne.NoticeResult(
+            result_id=1, page_number=3, index_on_page=1,
+            image_bgr=np.full((200, 150, 3), 240, np.uint8),
+            confidence=91, method="box+ocr", notice_type=notice_type)
+        r.ocr_text = "આ નોટીસ પ્રસિદ્ધ થયેથી દિન-૭માં"     # body says નોટિસ
+        return r
+
+    # (a) crops already read: the engine-is-None path.
+    already = fresh("chetavni")
+    already.ocr_done = True
+    pne.read_notice_crops([already], None)
+    assert already.notice_type == "chetavni", \
+        "the body text overrode the header the detector actually read"
+
+    # (b) crops NOT yet read: the path that actually runs OCR.  This is the
+    # one that overwrote a good detection answer with a worse crop-level one
+    # and put 13 of 59 real notices back to "unknown" - and the None-engine
+    # test above passed the whole time, because only that branch was guarded.
+    class _Engine:
+        """Reads the BODY only - which is what psm 11 really does to these
+        crops: it drops the big display-type header line."""
+        name = "stub"
+
+        def read_words(self, gray):
+            return [pne.OcrWord(text=t, x=0, y=120, w=40, h=14, conf=90)
+                    for t in "આ નોટીસ પ્રસિદ્ધ થયેથી દિન-૭માં".split()]
+
+    unread = fresh("chetavni")
+    pne.read_notice_crops([unread], _Engine())
+    assert unread.ocr_done, "the crop was never marked read"
+    assert unread.notice_type == "chetavni", \
+        "reading the crop overwrote the type detection had already read"
+
+    # ...but a notice detection could NOT identify still gets classified.
+    unknown = fresh("")
+    pne.read_notice_crops([unknown], _Engine())
+    assert unknown.notice_type == "notice", \
+        "an unidentified notice was left unclassified"
+    print("ok  the header's notice type reaches the result and is not "
+          "overwritten")
+
+
+def test_notice_type_is_read_off_the_crop():
+    """classify_notice_text labels a crop from its own printed header, and
+    does NOT change its answer because of what the run is filtering for."""
+    was = pne.active_notice_type()
+    try:
+        for mode in pne.NOTICE_TYPE_CHOICES:
+            pne.set_notice_type(mode)
+            for text, expected in (
+                    ("જાહેર નોટિસ આથી જણાવવામાં આવે છે", "notice"),
+                    ("જાહેર ચેતવણી આથી જાહેર જનતાને", "chetavni"),
+                    ("જાહેરચેતવણી મિલકત બાબત", "chetavni"),
+                    ("PUBLIC NOTICE is hereby given", "notice"),
+                    ("Public Warning about plot 12", "chetavni"),
+                    ("સર્વે નંબર ૪૨ ની મિલકત", ""),
+                    ("", "")):
+                got = pne.classify_notice_text(text)
+                assert got == expected, \
+                    f"{text[:30]!r} -> {got!r}, wanted {expected!r} " \
+                    f"(toggle was {mode})"
+    finally:
+        pne.set_notice_type({"notice": "જાહેર નોટિસ",
+                             "chetavni": "જાહેર ચેતવણી"}.get(was, "All"))
+    print("ok  notice type is read off the crop, whatever the toggle says")
+
+
+def test_one_category_covers_notice_and_chetavni():
+    """જાહેર નોટિસ and જાહેર ચેતવણી are ONE category, matched by one call
+    against one piece of text - not two pipelines and not two OCR passes.
+
+    Also covers the OCR damage the request lists: extra spaces, missing
+    spaces, split lines, dropped matras, and the Latin spellings (header
+    strips are read guj+eng, so an English header must not be a silent
+    miss)."""
+    was = pne.active_notice_type()
+    try:
+        pne.set_notice_type("All")
+        for text in ("જાહેર નોટિસ આથી જણાવવામાં આવે છે",
+                     "જાહેર ચેતવણી આથી જાહેર જનતાને",
+                     "જાહેર  ચેતવણી",          # extra spaces
+                     "જાહેરચેતવણી",             # no space at all
+                     "જાહેર\nચેતવણી",           # split across lines
+                     "જાહેર ચેતવણિ",            # OCR dropped the matra
+                     "PUBLIC NOTICE is hereby given",
+                     "JAHER CHETAVNI to all concerned",
+                     "Public Warning regarding survey no 42"):
+            score, keyword = pne.match_notice_text(text, False)
+            assert score > 0, f"missed {text!r}"
+            assert keyword in pne.STRICT_KEYWORDS, keyword
+
+        # ...and the vetoes still veto.
+        for text in ("ટેન્ડર નોટિસ", "જાહેર હરાજી", "TENDER NOTICE",
+                     "public auction of the plot"):
+            assert pne.match_notice_text(text, False)[0] == 0.0 or \
+                pne.match_negative_text(text)[0] > 0, \
+                f"{text!r} would be extracted as a public notice"
+
+        # The toggle narrows the SAME category rather than switching engine.
+        pne.set_notice_type("જાહેર નોટિસ")
+        assert pne.match_notice_text("જાહેર ચેતવણી આથી", False)[0] == 0.0
+        assert pne.match_notice_text("Public Warning here", False)[0] == 0.0
+        pne.set_notice_type("જાહેર ચેતવણી")
+        assert pne.match_notice_text("જાહેર નોટિસ આથી", False)[0] == 0.0
+        assert pne.match_notice_text("PUBLIC NOTICE here", False)[0] == 0.0
+        assert pne.match_notice_text("જાહેર ચેતવણી આથી", False)[0] > 0.0
+    finally:
+        pne.set_notice_type({"notice": "જાહેર નોટિસ",
+                             "chetavni": "જાહેર ચેતવણી"}.get(was, "All"))
+    print(f"ok  one category ({pne.NOTICE_CATEGORY}) covers નોટિસ + ચેતવણી "
+          f"in {len(pne.STRICT_KEYWORDS)} spellings")
+
+
+def test_keyword_script_guard_changes_no_result():
+    """Carrying the English spellings must not cost anything on a Gujarati
+    page, and the shortcut that makes it free must be exact.
+
+    match_notice_text skips keywords written in a script the text does not
+    contain at all.  That is sound because fuzzy_contains compares
+    characters - a Latin needle against a haystack with no Latin scores 0 -
+    but "sound" is worth an assertion, because a wrong skip is a notice
+    nobody ever sees."""
+    import random
+
+    from notice_extractor.utils.search import (fuzzy_contains,
+                                               normalize_ocr_text)
+
+    def naive(text, keywords, ratio):
+        """The loop this replaced: every keyword, no skipping."""
+        normalized = normalize_ocr_text(text)
+        if not normalized:
+            return 0.0, ""
+        best, best_kw = 0.0, ""
+        for keyword in keywords:
+            score = fuzzy_contains(normalized, normalize_ocr_text(keyword),
+                                   ratio)
+            if score > best:
+                best, best_kw = score, keyword
+        return best, best_kw
+
+    random.seed(11)
+    pieces = ["જાહેર", "નોટિસ", "ચેતવણી", "નોટીસ", "public", "notice",
+              "warning", "tender", "હરાજી", "મિલકત", "jaher", "chetavni",
+              "ટેન્ડર", "42", "જાહર", "નોિટસ", "PUBLIC", "NOTICE", ""]
+    cases = [" ".join(random.choice(pieces)
+                      for _ in range(random.randint(1, 8)))
+             for _ in range(1500)]
+
+    was = pne.active_notice_type()
+    checked = 0
+    try:
+        for label in pne.NOTICE_TYPE_CHOICES:
+            pne.set_notice_type(label)
+            keywords = pne.active_strict_keywords()
+            for text in cases:
+                assert pne.match_notice_text(text, False) == \
+                    naive(text, keywords, pne.FUZZY_MATCH_RATIO), text
+                checked += 1
+        for text in cases:
+            assert pne.match_negative_text(text) == \
+                naive(text, pne.NEGATIVE_KEYWORDS,
+                      pne.NEGATIVE_FUZZY_RATIO), text
+            checked += 1
+    finally:
+        pne.set_notice_type({"notice": "જાહેર નોટિસ",
+                             "chetavni": "જાહેર ચેતવણી"}.get(was, "All"))
+    print(f"ok  keyword script guard identical over {checked} comparisons")
+
+
+def test_console_survives_gujarati_output():
+    """Printing this app's own text must not kill the process.
+
+    Everything here is named in Gujarati, and Windows hands a redirected or
+    piped stream the ANSI codepage - so `qa_run.py > report.txt` died on its
+    eighth line with the extraction still running."""
+    import subprocess
+
+    script = ("import sys; sys.path.insert(0, %r);"
+              "import notice_extractor;"
+              "print('\\u0a9c\\u0abe\\u0ab9\\u0ac7\\u0ab0 "
+              "\\u0aa8\\u0acb\\u0a9f\\u0abf\\u0ab8 \\u2715')" % ROOT)
+    environment = dict(os.environ)
+    # Force the failing configuration rather than inheriting a lucky one.
+    environment.pop("PYTHONIOENCODING", None)
+    environment.pop("PYTHONUTF8", None)
+    environment["PYTHONLEGACYWINDOWSSTDIO"] = "1"
+    done = subprocess.run([sys.executable, "-X", "utf8=0", "-c", script],
+                          capture_output=True, env=environment, timeout=60)
+    assert done.returncode == 0, done.stderr.decode("utf-8", "replace")[-400:]
+    print("ok  Gujarati output survives a redirected console")
+
+
 def test_fuzzy_contains_pruning_changes_no_result():
     """fuzzy_contains skips windows whose cheap upper bound is already below
     the threshold.  That is only allowed to be faster, never different - and
@@ -1077,6 +2481,30 @@ def main() -> int:
         test_startup_never_fails_silently,
         test_doctor_reports_the_environment,
         test_empty_hint_goes_away_when_a_notice_arrives,
+        test_empty_hint_is_actually_visible,
+        test_search_bar_hides_remove_until_there_is_something_to_remove,
+        test_recent_search_history_round_trips_through_the_ui,
+        test_a_match_without_boxes_is_still_shown,
+        test_searching_filters_the_gallery_by_itself,
+        test_notice_type_click_filters_what_is_on_screen,
+        test_saving_and_counting_follow_the_filter,
+        test_a_late_log_line_cannot_undo_the_shutdown_wipe,
+        test_a_new_run_unsticks_a_background_read,
+        test_one_bad_message_does_not_kill_the_pump,
+        test_normal_cards_ask_one_question_only,
+        test_review_queue_is_the_only_place_you_confirm,
+        test_learning_needs_repetition_and_protects_recall,
+        test_short_negative_keywords_do_not_veto_on_a_name,
+        test_status_log_starts_closed_and_comes_back_whole,
+        test_help_guide_opens_without_breaking_scrolling,
+        test_the_ocr_header_test_reads_a_shallower_band,
+        test_the_preview_drops_a_notice_the_filter_hid,
+        test_recording_the_header_family_changes_no_detection,
+        test_the_header_family_reaches_the_notice,
+        test_notice_type_is_read_off_the_crop,
+        test_one_category_covers_notice_and_chetavni,
+        test_keyword_script_guard_changes_no_result,
+        test_console_survives_gujarati_output,
         test_fuzzy_contains_pruning_changes_no_result,
         test_page_sweep_looks_for_every_active_notice_type,
         test_sweep_gate_only_where_a_real_template_backs_it,
@@ -1089,6 +2517,7 @@ def main() -> int:
         test_gallery_routes_interleaved_results,
         test_gallery_creates_section_on_demand,
         test_reporter_streams_immediately,
+        test_agent_retries_transient_failures_but_never_credentials,
         test_ocr_chain_prefers_gujarati,
         test_ocr_engine_is_cached,
         test_detect_gate_bounds_concurrency,
