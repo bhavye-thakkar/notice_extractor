@@ -279,11 +279,20 @@ def ngs_get_page_image(downloader: PageDownloader, page: PageRef,
 
 class NavGujaratSamayPipeline(NoticeDetectionPipeline):
     """Nav Gujarat Samay: bold Gujarati notice headers, so all embedded
-    real-paper samples are used with slightly softer thresholds (its
-    renders are lower resolution and upscaled)."""
+    real-paper samples are used.
+
+    box threshold 0.68, not the old 0.64: the renders are low-resolution
+    upscales, and at 0.64 blurry NON-notice content template-matched its
+    way straight into the results - a Bank of India possession-notice
+    table scored 0.66 and shipped as two fragments, both of which the user
+    rejected (feedback.jsonl, p5, 2026-08-13).  Raising the bar does NOT
+    drop those candidates: scores under it fall through to the OCR
+    keyword check (the strip must actually read જાહેર નોટિસ) and, failing
+    that, to the Not Sure queue - so recall stays with the user while the
+    results stay clean."""
     newspaper_name = "Nav Gujarat Samay"
     default_config = DetectionConfig(
-        box_match_threshold=0.64,
+        box_match_threshold=0.68,
         page_match_threshold=0.70,
     )
     embedded_prefixes = None            # every positive sample

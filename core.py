@@ -129,35 +129,74 @@ try:
 except ImportError:
     _MISSING_DEPENDENCIES.append("pillow")
     Image = ImageTk = ImageDraw = ImageFont = pil_features = None  # type: ignore
-try:
-    import pymupdf as _pymupdf_probe  # noqa: F401
-except ImportError:
-    try:
-        import fitz as _pymupdf_probe  # noqa: F401
-    except ImportError:
-        _MISSING_DEPENDENCIES.append("pymupdf")
+# PyMuPDF and pytesseract are PROBED here (is the package installed?) but
+# imported only on first use.  Importing them at startup cost 1.8 s of the
+# window's time-to-open - pytesseract alone pulls pandas in for 1.4 s - and
+# the window needs neither: PDFs and OCR are first touched on worker
+# threads, which is where the one-time import cost now lands.
+import importlib.util as _importlib_util
+
+# pytesseract's only use of pandas is offering DataFrame output, which this
+# app never asks for - yet importing it costs 1.4 s and ~100k objects.  With
+# the import now happening on a worker thread, that allocation spike also
+# triggered a GC there, which finalised leftover Tk Variables from a non-Tk
+# thread (Tcl aborts on that).  Blocking pandas fixes both: pytesseract
+# handles the ImportError and skips DataFrame support.  Nothing else in this
+# process uses pandas; a future plugin that wants it must remove this line.
+sys.modules.setdefault("pandas", None)  # type: ignore[arg-type]
+
+
+def _module_installed(*names: str) -> bool:
+    for name in names:
+        try:
+            if _importlib_util.find_spec(name) is not None:
+                return True
+        except (ImportError, ValueError):
+            continue
+    return False
+
 
 # Optional PDF rendering (local e-paper PDF files):  pip install pymupdf
-try:
-    import pymupdf as fitz  # type: ignore
-    _HAVE_FITZ = True
-except ImportError:
-    try:
-        import fitz  # type: ignore  # older PyMuPDF releases
-        _HAVE_FITZ = True
-    except ImportError:
-        fitz = None  # type: ignore
-        _HAVE_FITZ = False
+_HAVE_FITZ = _module_installed("pymupdf", "fitz")
+if not _HAVE_FITZ:
+    _MISSING_DEPENDENCIES.append("pymupdf")
+fitz = None  # type: ignore   # loaded by _load_fitz() on first PDF use
+
+
+def _load_fitz():
+    """Import PyMuPDF on first use (see the note above)."""
+    global fitz, _HAVE_FITZ
+    if fitz is None and _HAVE_FITZ:
+        try:
+            import pymupdf as _fitz_mod  # type: ignore
+        except ImportError:
+            try:
+                import fitz as _fitz_mod  # type: ignore  # older releases
+            except ImportError:
+                _HAVE_FITZ = False
+                return None
+        fitz = _fitz_mod
+    return fitz
+
 
 # Optional OCR support.  Two engines, auto-fallback:
 #   1. Tesseract (pytesseract + the Tesseract program with 'guj' data)
 #   2. Windows built-in OCR (winsdk / winrt + the Gujarati language pack)
-try:
-    import pytesseract  # type: ignore
-    _HAVE_PYTESSERACT = True
-except ImportError:
-    pytesseract = None  # type: ignore
-    _HAVE_PYTESSERACT = False
+_HAVE_PYTESSERACT = _module_installed("pytesseract")
+pytesseract = None  # type: ignore  # loaded by _load_pytesseract()
+
+
+def _load_pytesseract():
+    """Import pytesseract on first use (see the note above)."""
+    global pytesseract, _HAVE_PYTESSERACT
+    if pytesseract is None and _HAVE_PYTESSERACT:
+        try:
+            import pytesseract as _pt  # type: ignore
+        except ImportError:
+            _HAVE_PYTESSERACT = False
+            return None
+        pytesseract = _pt
+    return pytesseract
 
 
 # =============================================================================
@@ -409,6 +448,13 @@ SWEEP_WORD_PAIRS: Tuple[Tuple[str, str], ...] = (
     ("જાહેર", "નોટ"),
     ("જાહેર", "ચેત"),          # જાહેર ચેતવણી (public warning)
 )
+# Words that mean ADVERTISEMENT, not notice.  Both begin with "જાહેર", so
+# the sweep's substring/fuzzy matching saw the title word "જાહેર" inside
+# them - "મિત્સુ કેમ પ્લાસ્ટની વધારાની જાહેરાત" (an ad about an ad!) became
+# a result on Nav Gujarat Samay p8 and was rejected by the user.  A word
+# carrying one of these fragments can never be the standalone "જાહેર" of a
+# notice title.
+SWEEP_AD_WORDS: Tuple[str, ...] = ("જાહેરાત", "જાહેરખબર")
 # Single OCR "words" that already contain the whole title (the printed form
 # runs the two words together, or OCR joins them), tagged with the notice
 # type they belong to so the run's toggle can filter them.
@@ -2208,13 +2254,18 @@ def _classify_result(result: "NoticeResult") -> str:
 
 
 def read_notice_crops(results: Sequence["NoticeResult"], engine,
-                      log: Optional[Callable[[str], None]] = None) -> int:
+                      log: Optional[Callable[[str], None]] = None,
+                      should_stop: Optional[Callable[[], bool]] = None) -> int:
     """OCR every crop that has not been read yet, and label its type.
 
     Detection only ever reads a header STRIP, so the crops arrive unread;
     this is the one place that reads them end to end, and both Find-text and
     the notice-type filter need exactly the same pass.  Returns how many were
-    read.  Runs on a worker thread - the caller owns that."""
+    read.  Runs on a worker thread - the caller owns that.
+
+    `should_stop` lets the background prefetch stand down mid-batch (a new
+    run starting, a user search taking over): a stopped crop is left with
+    ocr_done False, so whoever needs it next simply reads it then."""
     pending = [r for r in results if not r.ocr_done]
     if engine is None or not pending:
         # No engine: still label from whatever text is already there, so a
@@ -2227,6 +2278,8 @@ def read_notice_crops(results: Sequence["NoticeResult"], engine,
         log(f"reading {len(pending)} notice(s) with {engine.name}...")
 
     def read(result: "NoticeResult") -> None:
+        if should_stop is not None and (should_stop() or result.ocr_done):
+            return
         try:
             gray = cv2.cvtColor(result.image_bgr, cv2.COLOR_BGR2GRAY)
             result.ocr_words = engine.read_words(gray)
@@ -2598,11 +2651,16 @@ def _probe_windows_guj() -> Tuple[bool, str]:
 
 
 def _probe_easyocr() -> Tuple[bool, str]:
-    langs = EasyOcrEngine.available_langs()
-    if langs is None:
+    # find_spec ONLY - never import.  Importing easyocr pulls torch in: a
+    # measured 12 s DLL load that also blocks the Tk message pump through
+    # the Windows loader lock (the window froze for the whole import), plus
+    # ~700 MB of RSS for the life of the process.  This probe runs at every
+    # app start, and the engine chain only ever reaches EasyOCR when BOTH
+    # Windows OCR and Tesseract are missing - the one place that may still
+    # import it is EasyOcrEngine.create().
+    if not _module_installed("easyocr"):
         return False, "not installed"
-    return True, ("with Gujarati" if "gu" in langs
-                  else "installed (no Gujarati model upstream)")
+    return True, "installed (loads only if no other engine works)"
 
 
 def _install_pip(line_callback: Callable[[str], None]) -> bool:
@@ -2810,6 +2868,14 @@ class NoticeResult:
     #: True while this notice is in the Not Sure queue rather than the
     #: results list - see GalleryPanel.review_results().
     needs_review: bool = False
+    #: The 210px gallery thumbnail, built ONCE on the worker thread that
+    #: found the notice (ensure_thumbnail).  The gallery used to LANCZOS-
+    #: resize the full crop on the Tk thread for EVERY card build - measured
+    #: at 4-52 ms per card, sixty cards a page, re-done on every search,
+    #: filter, feedback click and page turn - which was the single largest
+    #: source of UI stalls.  A crop never changes, so its thumbnail is
+    #: computed once and kept.
+    thumb_pil: Optional["Image.Image"] = None
 
     @property
     def suggested_filename(self) -> str:
@@ -2824,6 +2890,24 @@ class NoticeResult:
         prefix = f"{self.edition}  ·  " if self.edition else ""
         return (f"{prefix}Page {self.page_number}  ·  #{self.index_on_page}"
                 f"  ·  {self.confidence}%")
+
+
+def ensure_thumbnail(result: NoticeResult) -> "Image.Image":
+    """The cached gallery thumbnail for `result`, building it if missing.
+
+    Called on the worker thread by ProgressReporter.result() so the resize
+    never lands on the Tk thread; the call in NoticeCard is only the fallback
+    for results that reached the gallery some other way (tests, old saves).
+    If two threads race here they build the same image twice and one wins -
+    harmless, so no lock."""
+    thumb = result.thumb_pil
+    if thumb is None:
+        pil = bgr_to_pil(result.image_bgr)
+        scale = GALLERY_THUMB_WIDTH / max(1, pil.width)
+        thumb = pil.resize((GALLERY_THUMB_WIDTH,
+                            max(1, int(pil.height * scale))), Image.LANCZOS)
+        result.thumb_pil = thumb
+    return thumb
 
 
 class ProgressReporter:
@@ -2856,6 +2940,13 @@ class ProgressReporter:
         self._q.put(("progress", current, total))
 
     def result(self, res: NoticeResult) -> None:
+        # Thumbnail built here, on the worker that found the notice, so the
+        # Tk thread only converts a ready 210px image (0.1 ms) instead of
+        # LANCZOS-resizing the full crop (4-52 ms) on every card build.
+        try:
+            ensure_thumbnail(res)
+        except Exception:
+            pass                  # the card path can still build its own
         self._q.put(("result", res))
 
     def heading(self, text: str) -> None:
@@ -3061,7 +3152,7 @@ def pdf_discover_pages(url: str,
     path = pdf_path_from_url(url)
     if path is None:
         raise ExtractionError("The PDF file could not be found:\n" + url)
-    if not _HAVE_FITZ:
+    if _load_fitz() is None:
         raise ExtractionError(
             "Reading PDF files needs the PyMuPDF package.\n"
             "Press 'Download Dependencies' (it installs pymupdf), restart "
@@ -3086,6 +3177,8 @@ def pdf_discover_pages(url: str,
 
 def pdf_render_page(path: str, page_number: int) -> "np.ndarray":
     """Render one PDF page to a BGR image at print-quality width."""
+    if _load_fitz() is None:
+        raise ExtractionError("Reading PDF files needs the PyMuPDF package.")
     document = fitz.open(path)
     try:
         page = document[page_number - 1]
@@ -3106,7 +3199,7 @@ def pdf_pages_from_web(downloader: PageDownloader, pdf_url: str,
                        reporter: ProgressReporter) -> List[PageRef]:
     """Download an e-paper PDF from the web and expose its pages exactly
     like a local PDF file (used by Divya Bhaskar and pasted .pdf links)."""
-    if not _HAVE_FITZ:
+    if _load_fitz() is None:
         raise ExtractionError(
             "Reading PDF files needs the PyMuPDF package.\n"
             "Press 'Download Dependencies' (it installs pymupdf), restart "
@@ -3201,6 +3294,32 @@ class TesseractOcrEngine(BaseOcrEngine):
         # model alongside them cost 14 s a page and found nothing extra.
         self.sweep_lang = "guj" if supports_gujarati else lang
 
+    # -- direct tesseract calls ------------------------------------------------
+    # Same binary, same language, same --psm as pytesseract used - but the
+    # image goes down stdin as an in-memory PNG and the text comes back on
+    # stdout.  pytesseract's per-call routine (PIL save to a NamedTemporaryFile,
+    # subprocess with two pipe-reader THREADS, glob over the temp dir to clean
+    # up) is pure-Python work that holds the GIL; stack-sampling the frozen UI
+    # during a full 8-agent run kept finding exactly those frames under the
+    # stall.  One pipe, no temp files, no reader threads.  pytesseract still
+    # answers "which languages exist" at engine creation.
+
+    def _run_tesseract(self, gray: "np.ndarray", lang: str, psm: int,
+                       output: str = "txt") -> str:
+        ok, png = cv2.imencode(".png", gray)
+        if not ok:
+            return ""
+        flags = 0
+        if sys.platform.startswith("win"):
+            flags = subprocess.CREATE_NO_WINDOW
+        done = subprocess.run(
+            [pytesseract.pytesseract.tesseract_cmd, "stdin", "stdout",
+             "-l", lang, "--psm", str(psm)]
+            + (["tsv"] if output == "tsv" else []),
+            input=png.tobytes(), stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, creationflags=flags, timeout=120)
+        return done.stdout.decode("utf-8", errors="replace")
+
     @staticmethod
     def find_binary() -> Optional[str]:
         """tesseract.exe, preferring a copy on the app's own drive.
@@ -3256,7 +3375,7 @@ class TesseractOcrEngine(BaseOcrEngine):
 
     @classmethod
     def create(cls) -> Optional["TesseractOcrEngine"]:
-        if not _HAVE_PYTESSERACT:
+        if _load_pytesseract() is None:
             return None
         binary = cls.find_binary()
         if not binary:
@@ -3290,8 +3409,7 @@ class TesseractOcrEngine(BaseOcrEngine):
         pieces = []
         for psm in (11, 6):
             try:
-                pieces.append(pytesseract.image_to_string(
-                    gray, lang=self.lang, config=f"--psm {psm}"))
+                pieces.append(self._run_tesseract(gray, self.lang, psm))
             except Exception:
                 continue
             if early_stop is not None and pieces and early_stop(pieces[-1]):
@@ -3303,24 +3421,31 @@ class TesseractOcrEngine(BaseOcrEngine):
         words: List[OcrWord] = []
         try:
             # psm 11: sparse text - finds isolated headlines on a full page.
-            data = pytesseract.image_to_data(
-                gray, lang=lang or self.lang, config="--psm 11",
-                output_type=pytesseract.Output.DICT)
+            # tsv columns: level page block par line word left top width
+            # height conf text - the same table image_to_data parsed.
+            tsv = self._run_tesseract(gray, lang or self.lang, 11,
+                                      output="tsv")
         except Exception:
             return words
-        for i in range(len(data.get("text", []))):
-            text = (data["text"][i] or "").strip()
+        for line in tsv.splitlines()[1:]:
+            cells = line.split("\t")
+            if len(cells) < 12:
+                continue
+            text = cells[11].strip()
             if not text:
                 continue
             try:
-                conf = float(data["conf"][i])
+                conf = float(cells[10])
             except (TypeError, ValueError):
                 conf = -1.0
             if conf < 20:          # ignore garbage
                 continue
-            words.append(OcrWord(text, int(data["left"][i]),
-                                 int(data["top"][i]), int(data["width"][i]),
-                                 int(data["height"][i]), conf / 100.0))
+            try:
+                words.append(OcrWord(text, int(cells[6]), int(cells[7]),
+                                     int(cells[8]), int(cells[9]),
+                                     conf / 100.0))
+            except (TypeError, ValueError):
+                continue
         return words
 
 
@@ -3613,7 +3738,7 @@ def validate_ocr_setup() -> Tuple[List[str], List[str]]:
     # -- 2. Tesseract ----------------------------------------------------------
     if not USE_TESSERACT_OCR:
         status.append("Tesseract   : disabled (USE_TESSERACT_OCR = False)")
-    elif not _HAVE_PYTESSERACT:
+    elif _load_pytesseract() is None:
         status.append("Tesseract   : pytesseract NOT installed")
         fixes.append("Tesseract: run  pip install pytesseract  and install "
                      "the Tesseract program (see below)")
@@ -3647,19 +3772,21 @@ def validate_ocr_setup() -> Tuple[List[str], List[str]]:
                     + local_tessdata_dir() + "', no admin rights needed)")
 
     # -- 3. EasyOCR ------------------------------------------------------------
+    # Presence-checked without importing it: the import costs a 12 s torch
+    # DLL load (which freezes the window through the Windows loader lock)
+    # and ~700 MB of memory.  select_ocr_engine() runs this report on the
+    # FIRST extraction, so an import here would land that freeze on the
+    # first click.  EasyOcrEngine.create() still imports it for real when
+    # the chain actually reaches it.
     if not USE_EASYOCR:
         status.append("EasyOCR     : disabled (USE_EASYOCR = False)")
+    elif not _module_installed("easyocr"):
+        status.append("EasyOCR     : NOT installed")
+        fixes.append("EasyOCR (last resort): pip install easyocr  "
+                     "- note it has no Gujarati model today")
     else:
-        langs = EasyOcrEngine.available_langs()
-        if langs is None:
-            status.append("EasyOCR     : NOT installed")
-            fixes.append("EasyOCR (last resort): pip install easyocr  "
-                         "- note it has no Gujarati model today")
-        elif "gu" in langs:
-            status.append("EasyOCR     : READY with Gujarati")
-        else:
-            status.append("EasyOCR     : installed, NO Gujarati model "
-                          "(upstream limitation)")
+        status.append("EasyOCR     : installed (used only when no other "
+                      "engine works; no Gujarati model upstream)")
     return status, fixes
 
 
@@ -4697,6 +4824,8 @@ class NoticeDetectionPipeline:
                       if d.score >= GLOBAL_MIN_ACCEPT_SCORE
                       or "ocr" in d.method]
         detections = self._deduplicate(detections)
+        # --- Pass 3b: snap fragments to the page's own column grid ----------
+        detections = self._reconcile_columns(gray, detections)
         # --- Pass 4: split crops that contain SEVERAL notices ---------------
         detections = self._split_merged(detections, gray)
         # --- Pass 5: a crop fully containing another crop is a merged
@@ -4825,6 +4954,112 @@ class NoticeDetectionPipeline:
     # Two notices side-by-side or stacked can end up inside one detected box
     # (shared outer border / attached hit box).  If a crop contains multiple
     # જાહેર નોટિસ headers it is split along the ruling lines between them.
+    def _reconcile_columns(self, gray: "np.ndarray",
+                           detections: List[Detection]) -> List[Detection]:
+        """Snap fragment detections to the page's own notice-column width.
+
+        On notice-board pages (Sandesh p10/p11, measured 2026-08-14) the
+        bordered-box pass finds the real notices at a uniform column width,
+        but the page-scan/OCR fallbacks synthesise their boxes from ruling
+        lines - and these small notices carry an INTERNAL vertical rule
+        between their two text sub-columns.  The synthesiser kept landing on
+        that internal rule: half-width slivers (135 px in a 277 px grid),
+        some spanning two to four stacked notices, shown to the user as
+        fragments of notices that other detections already covered whole.
+
+        The page itself is the evidence: when >=3 verified boxes agree on a
+        column width, a detection under 72% of that width is a fragment.
+        Its width is snapped to the grid, the widened header strip is
+        re-verified (a real title spans the full column; if the re-score
+        fails the original box is kept untouched), and the result is
+        clipped against the notices already found in the same column so a
+        multi-notice span keeps only the territory nothing else covers.
+        The split pass that follows still divides any remaining tall spans
+        at their internal headers."""
+        if len(detections) < 3:
+            return detections
+        widths = sorted(d.rect[2] for d in detections
+                        if "template" in d.method or "ocr" in d.method)
+        if not widths:
+            return detections
+        med = widths[len(widths) // 2]
+        support = [w for w in widths if abs(w - med) <= med * 0.15]
+        if len(support) < 3:
+            return detections           # no consensus grid on this page
+        col_w = support[len(support) // 2]
+        full = [d for d in detections if d.rect[2] >= col_w * 0.85]
+        if not full:
+            return detections
+
+        out: List[Detection] = []
+        for det in detections:
+            x, y, w, h = det.rect
+            if w >= col_w * 0.72:
+                out.append(det)
+                continue
+            # Only a narrow detection whose x-range CONFLICTS with a
+            # full-width notice's column is a fragment.  A narrow box in
+            # its own column is simply a narrow notice - Sandesh's
+            # rightmost strip carries tall 135 px notices beside the
+            # tender column, and widening one of those pulled the tender
+            # text into the crop (measured p10: the widened box carried
+            # its neighbour's ટેન્ડર નોટિસ).  The page's own detections
+            # are the evidence either way.
+            cx = x + w // 2
+            hosts = [d.rect[0] for d in full
+                     if d.rect[0] <= cx <= d.rect[0] + d.rect[2]]
+            if not hosts:
+                out.append(det)         # its own column - narrow is real
+                continue
+            nx = int(clamp(min(hosts), 0, gray.shape[1] - 60))
+            nw = int(min(col_w, gray.shape[1] - nx))
+            # A real notice title spans its whole column: the widened header
+            # strip must still read as one, or the widening was wrong.
+            probe = Detection((nx, y, nw, h), det.score, det.method,
+                              det.family, det.uncertain)
+            strip = self._header_strip(gray, probe.rect)
+            if self.verifier.strip_score(strip) < self._cfg.review_low:
+                # Widening did not reveal a column-wide title.  If the
+                # fragment's OWN header strip cannot clear the review bar
+                # either, nothing about this sliver looks like a notice
+                # front - it goes to the Not Sure queue rather than the
+                # results (and rather than being silently dropped: recall
+                # decisions belong to the user, not to geometry).
+                own = self.verifier.strip_score(
+                    self._header_strip(gray, det.rect))
+                if own < self._cfg.review_low:
+                    out.append(Detection(det.rect, det.score, det.method,
+                                         det.family, uncertain=True))
+                else:
+                    out.append(det)     # do no harm - keep the original
+                continue
+            # Clip against same-column notices already found: keep only the
+            # span above the first one this fragment overlaps.
+            ny, nh = y, h
+            for other in sorted(full, key=lambda d: d.rect[1]):
+                ox, oy, ow, oh = other.rect
+                if min(nx + nw, ox + ow) - max(nx, ox) < col_w * 0.6:
+                    continue            # different column
+                if oy + oh <= ny + 40:
+                    continue            # ends above this fragment - no claim
+                    # (the first version skipped this test, and ANY notice
+                    # higher in the column silently deleted the fragment -
+                    # three real notices vanished from one Sandesh page.)
+                if oy <= ny + 40:
+                    # A full notice really covers this fragment's top -
+                    # everything the fragment shows is already on screen.
+                    nh = 0
+                    break
+                if oy < ny + nh:
+                    nh = oy - ny        # stop above the covered notice
+                    break
+            if nh < 90:
+                continue                # nothing left that others lack
+            out.append(Detection((nx, ny, nw, nh), det.score,
+                                 det.method + "+col", det.family,
+                                 det.uncertain))
+        return out
+
     def _split_merged(self, detections: List[Detection],
                       gray: "np.ndarray") -> List[Detection]:
         result: List[Detection] = []
@@ -4845,11 +5080,15 @@ class NoticeDetectionPipeline:
         if region.shape[0] < 90 or region.shape[1] < 90:
             return [det]
         # Rescan the crop with the full (finer) scale range - second headers
-        # are often smaller than the page-sweep scales - but at the SAME
-        # confidence threshold, otherwise body text on low-quality pages
-        # produces phantom "headers" and fragments the crop.
+        # are often smaller than the page-sweep scales.  The threshold has a
+        # FLOOR above the paper's own accept threshold: splitting needs more
+        # evidence than detecting.  Nav Gujarat Samay accepts at 0.64
+        # (upscaled low-res renders), and at that bar its blurry body text
+        # produced phantom "headers" at 0.66 that cut a single bank-notice
+        # table into two fragments - both of which the user rejected.  Real
+        # second headers score 0.90+ on every paper measured.
         hits = self.verifier.page_scan(
-            region, self._cfg.box_match_threshold,
+            region, max(self._cfg.box_match_threshold + 0.04, 0.70),
             scales=self._cfg.strip_scales)
         if len(hits) <= 1 or len(hits) > 6:
             return [det]          # nothing to split / too noisy to trust
@@ -4892,11 +5131,32 @@ class NoticeDetectionPipeline:
             x_bounds.append(x + w)
             for i in range(len(x_bounds) - 1):
                 cw = x_bounds[i + 1] - x_bounds[i]
-                if cw >= 70:
-                    cells.append(Detection(
-                        (x_bounds[i], cy0, cw, cy1 - cy0),
-                        det.score, det.method + "+split", det.family,
-                        det.uncertain))
+                if cw < 70:
+                    continue
+                # Shared INTERNAL boundaries are inset by the crop padding
+                # (+2 for the rule's own ink): crop() pads every edge back
+                # out, and padding across a shared divider put the last
+                # text line of one notice inside the top of the next crop
+                # (measured on Gujarat Samachar p8: two stacked notices
+                # met at y=1007 exactly, and both crops carried ~11 px of
+                # each other).  Outer edges keep the full pad.
+                ins = self._cfg.crop_padding + 2
+                cx0, cx1 = x_bounds[i], x_bounds[i + 1]
+                sy0, sy1 = cy0, cy1
+                if row_index > 0:
+                    sy0 += ins
+                if row_index < len(rows) - 1:
+                    sy1 -= ins
+                if i > 0:
+                    cx0 += ins
+                if i < len(x_bounds) - 2:
+                    cx1 -= ins
+                if cx1 - cx0 < 70 or sy1 - sy0 < 70:
+                    continue
+                cells.append(Detection(
+                    (cx0, sy0, cx1 - cx0, sy1 - sy0),
+                    det.score, det.method + "+split", det.family,
+                    det.uncertain))
         if len(cells) < 2:
             return [det]
         # Sanity: every cell must have its own header in its TOP part -
@@ -5027,9 +5287,12 @@ class NoticeDetectionPipeline:
                    if mode == "all" or mode == kind]
         if self._broad:
             singles += ["નોટિસ", "નોટીસ", "notice"]
+        ad_fragments = tuple(normalize_ocr_text(w) for w in SWEEP_AD_WORDS)
         for norm, word in normalized:
             if len(norm) < 4:
                 continue
+            if any(ad in norm for ad in ad_fragments):
+                continue              # "જાહેરાત" = advertisement, not a title
             for target in singles:
                 if fuzzy_contains(norm, normalize_ocr_text(target), 0.78):
                     hits.append((word.x, word.y, word.w, word.h,
@@ -5045,7 +5308,8 @@ class NoticeDetectionPipeline:
             first_n = normalize_ocr_text(first)
             second_n = normalize_ocr_text(second)
             starts = [w for n, w in normalized
-                      if n and fuzzy_contains(n, first_n, 0.75)]
+                      if n and not any(ad in n for ad in ad_fragments)
+                      and fuzzy_contains(n, first_n, 0.75)]
             ends = [w for n, w in normalized
                     if n and fuzzy_contains(n, second_n, 0.75)]
             for w1 in starts:
@@ -5608,6 +5872,13 @@ class ImagePreviewPanel(ttk.LabelFrame):
         self._zoom = 1.0
         self._fit_mode: Optional[str] = "fit_width"
         self._photo = None  # keep a reference or Tk garbage-collects it
+        #: Coalesces the per-pixel <Configure> storm of a window-resize drag
+        #: into one render, and remembers what is already on the canvas so an
+        #: identical render is skipped.  A fit-width render of a full-page
+        #: crop is a 10-90 ms LANCZOS resize on the Tk thread; one per drag
+        #: pixel is what made resizing the window crawl.
+        self._render_job = None
+        self._rendered_key: Optional[tuple] = None
 
         toolbar = ttk.Frame(self)
         toolbar.grid(row=0, column=0, columnspan=2, sticky="ew",
@@ -5732,6 +6003,11 @@ class ImagePreviewPanel(ttk.LabelFrame):
         iw, ih = self._pil_image.size
         tw = clamp(int(iw * zoom), 1, PREVIEW_MAX_RENDER_DIM)
         th = clamp(int(ih * zoom), 1, PREVIEW_MAX_RENDER_DIM)
+        # A resize drag fires many <Configure> events that all resolve to
+        # the same fitted size; re-resizing the same pixels is pure waste.
+        key = (id(self._pil_image), tw, th)
+        if key == self._rendered_key:
+            return
         resampler = Image.LANCZOS if zoom < 1.0 else Image.BICUBIC
         try:
             resized = self._pil_image.resize((tw, th), resampler)
@@ -5742,10 +6018,27 @@ class ImagePreviewPanel(ttk.LabelFrame):
         self._canvas.create_image(0, 0, image=self._photo, anchor="nw")
         self._canvas.configure(scrollregion=(0, 0, tw, th))
         self._zoom_label.configure(text=f"{int(round(zoom * 100))}%")
+        self._rendered_key = key
+
+    def _render_soon(self) -> None:
+        """One render per burst of <Configure> events, not one per pixel."""
+        if self._render_job is not None:
+            return
+        try:
+            self._render_job = self.after(50, self._render_debounced)
+        except tk.TclError:
+            self._render_job = None
+
+    def _render_debounced(self) -> None:
+        self._render_job = None
+        try:
+            self._render()
+        except tk.TclError:
+            pass                          # window going away mid-drag
 
     def _on_canvas_resized(self, _event) -> None:
         if self._fit_mode:
-            self._render()
+            self._render_soon()
 
     def _on_mousewheel(self, event) -> None:
         delta = -1 if getattr(event, "delta", 0) > 0 or \
@@ -5789,10 +6082,8 @@ class NoticeCard(ttk.Frame):
         self.result = result
         self.selected = tk.BooleanVar(value=True)
 
-        pil = bgr_to_pil(result.image_bgr)
-        scale = GALLERY_THUMB_WIDTH / max(1, pil.width)
-        thumb_h = max(1, int(pil.height * scale))
-        thumb = pil.resize((GALLERY_THUMB_WIDTH, thumb_h), Image.LANCZOS)
+        thumb = ensure_thumbnail(result)
+        scale = GALLERY_THUMB_WIDTH / max(1, result.image_bgr.shape[1])
         if matched:
             # Paint the hit the way a text selection looks: a translucent
             # blue wash over the word, drawn on the thumbnail so the box
@@ -5900,6 +6191,9 @@ class GalleryPanel(ttk.LabelFrame):
         #: pending coalesced work (see _layout / _request_nav)
         self._layout_job: Optional[str] = None
         self._nav_job: Optional[str] = None
+        #: batched page rendering (see _render_page / _build_card_batch)
+        self._card_batch_job: Optional[str] = None
+        self._pending_card_results: List[NoticeResult] = []
         self._last_width = 0
         self.on_show_more: Optional[Callable[[], None]] = None   # legacy
         self.on_page_change: Optional[Callable[[], None]] = None
@@ -6229,24 +6523,32 @@ class GalleryPanel(ttk.LabelFrame):
         else:
             self._search_label.configure(
                 text=f"no match for “{query}” in {scanned} notices")
-        self._refresh_after_search()
         # Land on the first paper that actually has a hit.  `matched`, not
         # `match_boxes` - a paper whose only hit came from a glued OCR word
-        # has no boxes and was skipped straight past.
+        # has no boxes and was skipped straight past.  The target is chosen
+        # BEFORE rendering so the page of cards is built once, not twice.
+        self._pages_cache = []
+        target = 0
         for index, section in enumerate(self.sections):
             if any(r.matched for r in section["results"]):   # type: ignore
-                self.goto_page(self._page_of(index, 0), user=False)
+                target = self._page_of(index, 0)
                 break
+        self._refresh_after_search(target)
 
     def refresh_filters(self) -> None:
         """Public name for "something changed what should be on screen"."""
         self._refresh_after_search()
 
-    def _refresh_after_search(self) -> None:
+    def _refresh_after_search(self, page_index: int = 0) -> None:
         """Re-render after a filter changed.  Also tells the Application, so
-        the "N of M notices" count cannot drift from what is on screen."""
+        the "N of M notices" count cannot drift from what is on screen.
+
+        `page_index` lets a caller that already knows where the view should
+        land (search_finished jumps to the first hit) get there in THIS
+        render instead of rendering page 0 and immediately rendering again -
+        a full page of cards, built twice, for one search."""
         self._pages_cache = []
-        self._page_index = 0
+        self._page_index = max(0, page_index)
         self._render_page()
         if self.on_filter_change is not None:
             self.on_filter_change()
@@ -6428,6 +6730,15 @@ class GalleryPanel(ttk.LabelFrame):
 
     # -- rendering ------------------------------------------------------------
     def _destroy_page_widgets(self) -> None:
+        # A batch still scheduled belongs to the page being torn down; left
+        # alive it would append that page's cards onto the next one.
+        if self._card_batch_job is not None:
+            try:
+                self.after_cancel(self._card_batch_job)
+            except tk.TclError:
+                pass
+            self._card_batch_job = None
+        self._pending_card_results = []
         self._harvest_selection()
         for card in self.cards:
             card.destroy()
@@ -6525,16 +6836,38 @@ class GalleryPanel(ttk.LabelFrame):
         self._empty_label.grid_forget()
         section_index, _chunk = pages[self._page_index]
         self._make_heading(self.page_label())
-        for result in self._current_results():
+        # Cards are built in BATCHES: the first screenful right now, the
+        # rest in small after() slices.  A 60-card page built in one go held
+        # the Tk thread for several hundred ms - the exact stall a search or
+        # page turn used to land on - while everything below the fold could
+        # perfectly well arrive a frame later.
+        self._pending_card_results = list(self._current_results())
+        self._canvas.yview_moveto(0.0)
+        self._build_card_batch()
+        self._update_nav()
+
+    #: Cards built per slice of the Tk thread.  A batch is ~50-100 ms of
+    #: widget work - long enough to fill the visible screen in one go,
+    #: short enough that input events run between batches.
+    CARD_RENDER_BATCH = 12
+
+    def _build_card_batch(self) -> None:
+        self._card_batch_job = None
+        batch = self._pending_card_results[:self.CARD_RENDER_BATCH]
+        del self._pending_card_results[:self.CARD_RENDER_BATCH]
+        for result in batch:
             card = NoticeCard(self._inner, result, self._on_open,
                               self._on_save, self._on_click,
                               self._on_copy, self._on_feedback)
             if id(result) in self._deselected:
                 card.selected.set(False)
             self.cards.append(card)
-        self._canvas.yview_moveto(0.0)
         self._layout()
-        self._update_nav()
+        if self._pending_card_results:
+            try:
+                self._card_batch_job = self.after(15, self._build_card_batch)
+            except tk.TclError:
+                self._pending_card_results = []
 
     def _update_nav(self) -> None:
         pages = self._page_list()
@@ -7218,6 +7551,14 @@ class Application(ttk.Frame):
         self._paper_counts: Dict[str, int] = {}
         self._result_seq = 0
         self._searching = False
+        #: Feedback learning runs here, one task at a time: clicks must
+        #: append to the evidence file and rebuild the model IN ORDER, and
+        #: none of it belongs on the Tk thread (see on_feedback).
+        self._learn_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="learn")
+        #: Bumped whenever the background crop-OCR prefetch must stand down
+        #: (a new run starting, a user search taking over the OCR pool).
+        self._prefetch_gen = 0
         self._guj_ui_font = find_gujarati_ui_font(root)
 
         root.title(APP_TITLE)
@@ -7229,7 +7570,33 @@ class Application(ttk.Frame):
         self.pack(fill="both", expand=True)
         self._install_global_wheel()
         self._poll_queue()
+        # After the first paint, not before it: the whole point of the lazy
+        # imports is a window that opens fast.
+        root.after(300, self._preload_native_libs)
         root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _preload_native_libs(self) -> None:
+        """Import the DLL-heavy optional libraries ON the Tk thread, at idle.
+
+        Loading DLLs from a worker thread while Tcl pumps messages freezes
+        the window through the Windows loader lock - measured at 12 s for
+        torch (decision #22f) and worse for a cold PyMuPDF mid-extraction.
+        Importing here, once, means the thread that owns the message pump is
+        the thread holding the loader lock, so nothing can block it: the
+        cost is one ~0.3-0.6 s hiccup at startup idle, before any click
+        needs these.  Workers importing first anyway (headless runs, a very
+        fast Extract click) still work - this is belt, that is braces."""
+        for load in (_load_fitz, _load_pytesseract,
+                     WindowsOcrEngine._import_winsdk):
+            try:
+                load()
+            except Exception:
+                pass                    # absence is handled at the use site
+        # Executor threads spawn lazily on first submit; make that happen
+        # NOW, at idle, so the first real submit (the crop prefetch, which
+        # lands mid thread-teardown at run end) finds its thread already
+        # alive instead of creating one under the loader lock.
+        self._learn_pool.submit(lambda: None)
 
     # -- style ----------------------------------------------------------------
     def _init_style(self) -> None:
@@ -8004,6 +8371,7 @@ class Application(ttk.Frame):
         if self._searching:            # a read is already in flight
             return
         self._searching = True
+        self._prefetch_gen += 1        # this read takes over from prefetch
         self._type_hint.configure(text="reading notices...")
         msg_queue = self._msg_queue
 
@@ -8239,6 +8607,9 @@ class Application(ttk.Frame):
         # The notice-type toggle applies per run; the agents and their
         # template verifiers all read it at construction time.
         set_notice_type(self.notice_type_var.get())
+        # A prefetch still reading the LAST run's crops must not compete
+        # with the new run for the OCR pool; its remaining crops no-op.
+        self._prefetch_gen += 1
         self._msg_queue = queue.Queue()
         self._cancel_event = threading.Event()
         # A background crop read (Find-text, or a Notice-type click) captured
@@ -8355,6 +8726,48 @@ class Application(ttk.Frame):
         self.save_selected_btn.configure(state=state)
         self._set_phase("Done")
         self.status_bar.configure(text=status_text)
+        self._start_ocr_prefetch()
+
+    def _start_ocr_prefetch(self) -> None:
+        """Read every crop in the background while the machine is idle.
+
+        Detection only OCRs header strips, so the first search / type filter
+        / feedback click used to pay a 'reading N notices' bill on demand -
+        3.4 s for 13 notices, growing with the run.  The run just ended, the
+        CPU is free, and the text is going to be wanted: read it now.  The
+        prefetch stands down (per-crop) the moment a new run or a user
+        search needs the OCR pool, and crops it did not finish stay unread
+        for the on-demand path to pick up - no result can change, only when
+        the work happens."""
+        results = self.gallery.all_results()
+        if not results or all(r.ocr_done for r in results):
+            return
+        self._prefetch_gen += 1
+        gen = self._prefetch_gen
+        msg_queue = self._msg_queue
+
+        def run() -> None:
+            try:
+                engine = select_ocr_engine(_SilentReporter())
+                if engine is None:
+                    return
+                read_notice_crops(
+                    results, engine,
+                    should_stop=lambda: gen != self._prefetch_gen)
+                if gen == self._prefetch_gen:
+                    msg_queue.put(("prefetched",))
+            except Exception:
+                run_logger.log("crop prefetch failed:\n"
+                               + traceback.format_exc(), "error")
+
+        # Submitted to the pre-warmed learn pool, NOT a fresh Thread.  This
+        # fires at the exact moment run_jobs is tearing down its agent
+        # threads and cv2 is rebuilding its own pool; on Windows every
+        # thread create/destroy serialises on the loader lock, and a
+        # Thread.start() here was measured blocking the Tk thread for 33 s
+        # behind that teardown convoy.  The pool thread already exists, so
+        # nothing needs creating inside the storm.
+        self._learn_pool.submit(run)
 
     # -- dependency installer -------------------------------------------------
     def download_dependencies(self) -> None:
@@ -8535,6 +8948,26 @@ class Application(ttk.Frame):
             self._searching = False
             self.gallery.apply_type_filter()
             self._show_type_count(message[1])
+        elif kind == "learned":
+            corrections, hidden = message[1], message[2]
+            # Re-render only when the learned model could have CHANGED what
+            # is on screen: something is hidden (or hidden things are being
+            # shown), or a filter is active.  A refresh resets the page, and
+            # doing that seconds after the click, while the user is reading,
+            # needs a reason.
+            if hidden or self.gallery.show_hidden or \
+                    self.gallery.is_filtered():
+                self.gallery.refresh_filters()
+            self._update_count()
+            self._set_phase(f"Thanks - learned from {corrections} "
+                            "correction(s)")
+        elif kind == "prefetched":
+            # The background crop read finished: types and learned scores
+            # are now filled in for every notice.  Same refresh rule as
+            # above - update what could have changed, do not yank the view.
+            if self.gallery.is_filtered() or self.gallery.hidden_count():
+                self.gallery.refresh_filters()
+            self._update_count()
         elif kind == "deps_done":
             self._dependencies_finished(message[1])
             self.refresh_setup_status()      # an install may have fixed things
@@ -8592,6 +9025,9 @@ class Application(ttk.Frame):
         if self._searching:
             return
         self._searching = True
+        # The search wants the OCR pool NOW; a background prefetch yields
+        # (its unfinished crops are simply read here instead).
+        self._prefetch_gen += 1
         msg_queue = self._msg_queue
 
         def run() -> None:
@@ -8708,34 +9144,50 @@ class Application(ttk.Frame):
     # -- feedback -------------------------------------------------------------
     def on_feedback(self, result: NoticeResult, verdict: str,
                     origin: str = "results") -> None:
-        """Record what the user said, and act on it immediately.
+        """Apply the click NOW, learn from it in the background.
 
-        The record is written before anything else: the click is the
-        evidence, and it has to survive even if the redraw below fails."""
-        from .utils import feedback as feedback_store
-
-        # A crop the user is judging must have been read, or the record
-        # carries no text and teaches nothing.  Cheap: one crop.
-        if not result.ocr_done:
-            engine = select_ocr_engine(_SilentReporter())
-            if engine is not None:
-                read_notice_crops([result], engine)
-
-        feedback_store.record(result, verdict, origin)
-        feedback_store.relearn()
-
+        The old version did everything inline on the Tk thread: OCR the crop
+        if it was unread (up to 1.5 s of frozen window), rebuild the model,
+        re-score every result, then re-render.  The click's visible effect -
+        this card leaves the results - needs none of that, so the UI updates
+        immediately and a worker does the learning; a 'learned' message
+        refreshes the counts when it lands."""
         if verdict == "negative":
             result.rejected = True
             result.needs_review = False
         else:
             result.needs_review = False       # confirmed - it belongs
             result.demoted = False
-        apply_learning(self.gallery.all_results())
         self.gallery.refresh_filters()
         self._update_count()
-        positive, negative = feedback_store.counts()
-        self._set_phase(f"Thanks - learned from {positive + negative} "
-                        "correction(s)")
+        self._set_phase("Noted - learning from it in the background...")
+
+        results = self.gallery.all_results()
+        msg_queue = self._msg_queue
+
+        def learn() -> None:
+            from .utils import feedback as feedback_store
+            try:
+                # A crop the user judged must be read, or the record carries
+                # no text and teaches nothing.
+                if not result.ocr_done:
+                    engine = select_ocr_engine(_SilentReporter())
+                    if engine is not None:
+                        read_notice_crops([result], engine)
+                # The record is written before the model: the click is the
+                # evidence, and it must survive even if learning fails.
+                feedback_store.record(result, verdict, origin)
+                feedback_store.relearn()
+                hidden = apply_learning(results)
+                positive, negative = feedback_store.counts()
+                msg_queue.put(("learned", positive + negative, hidden))
+            except Exception:
+                run_logger.log("feedback learning failed:\n"
+                               + traceback.format_exc(), "error")
+
+        # One worker, shared by every click: two rapid clicks must append
+        # and relearn in order, not race over the model file.
+        self._learn_pool.submit(learn)
 
     def _toggle_hidden(self) -> None:
         """Show or hide what the learned model demoted.  The way back from a
@@ -8852,6 +9304,10 @@ class Application(ttk.Frame):
                     parent=self.root):
                 return
             self._cancel_event.set()
+        self._prefetch_gen += 1              # stop any background crop read
+        # wait=False: a learn task mid-OCR must not hold the window open;
+        # its evidence line was already written before the model rebuild.
+        self._learn_pool.shutdown(wait=False)
         shutdown_ocr_pool()
         # Nothing a run produced stays on this machine: the crops were only
         # ever in memory unless Save wrote them somewhere you chose, and the
@@ -8971,6 +9427,15 @@ def main(newspaper_package=None) -> int:
     imported on a background thread by the launcher, so this only waits for
     that to finish and publishes the result to the registry."""
     _enable_windows_dpi_awareness()
+    # One interpreter lock, ~30 worker threads at full extraction: the Tk
+    # thread was measured (stack-sampled) waiting 0.7-1.3 s for the GIL
+    # while OCR workers ran pytesseract's Python-side plumbing and difflib
+    # matching.  A shorter switch interval hands the GIL to the starved UI
+    # thread sooner.  Same-evening 8-agent QA runs, this plus the direct
+    # tesseract calls: worst mid-run stall 1337/1274 ms -> 602-716 ms
+    # (median tick 12 ms throughout).  The full fix remains #21's process
+    # isolation.
+    sys.setswitchinterval(0.002)
 
     if _MISSING_DEPENDENCIES:
         return _run_dependency_bootstrap()
