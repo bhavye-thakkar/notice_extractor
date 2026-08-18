@@ -1674,22 +1674,34 @@ def test_review_queue_is_the_only_place_you_confirm():
                                   review=True, rid=1),
                  _feedback_result(pne, "આથી જાહેર જનતાને જણાવવાનું",
                                   review=True, rid=2)]
-        dialog = pne.ReviewDialog(root, queue,
-                                  lambda r, v: verdicts.append((r.result_id, v)),
-                                  "Segoe UI")
+
+        def verdict(r, v):
+            # What Application.on_feedback does to the result itself.
+            verdicts.append((r.result_id, v))
+            r.rejected = (v == "negative")
+
+        dialog = pne.ReviewDialog(root, queue, verdict, "Segoe UI")
         root.update()
         labels = [str(c.cget("text")) for c in _all_children(dialog)
                   if c.winfo_class() in ("TButton", "Button")]
         assert any("This Is Right" in t for t in labels), labels
         assert any("Not Related" in t for t in labels), labels
+        assert any("Previous" in t for t in labels), labels
+        assert any("Next" in t for t in labels), labels
 
-        dialog._decide("negative")
+        dialog._decide("negative")           # #1 dismissed - but KEPT
         root.update()
-        dialog._decide("positive")
+        assert dialog._current() is queue[1]     # moved on to #2
+        dialog._decide("positive")           # #2 confirmed - leaves
         root.update()
         assert verdicts == [(1, "negative"), (2, "positive")], verdicts
-        # The queue empties and the buttons go quiet rather than acting on
-        # nothing.
+        # The dismissed one is still here, restorable: Not Related is off,
+        # This Is Right is on.
+        assert dialog._current() is queue[0]
+        assert "disabled" in dialog._wrong_btn.state()
+        assert "disabled" not in dialog._right_btn.state()
+        dialog._decide("positive")           # restored
+        root.update()
         assert dialog._current() is None
         assert "disabled" in dialog._right_btn.state()
         dialog.destroy()

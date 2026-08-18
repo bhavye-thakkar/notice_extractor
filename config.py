@@ -110,7 +110,10 @@ PERSISTENT_NAMES: tuple = ("browser_profile", "divyabhaskar_session.txt",
                            # it.  Losing this on exit would mean the app
                            # forgets every correction the moment it closes.
                            "feedback.jsonl",
-                           "learned.json")
+                           "learned.json",
+                           # Every relearn decision with its metrics - what
+                           # makes "is the learning helping?" answerable.
+                           "learning_history.jsonl")
 
 
 def clear_run_data() -> list:

@@ -58,6 +58,15 @@ DEMOTE_SCORE = 1.5
 #: The template matched a real newspaper heading; a bag of words does not
 #: get to overrule that.
 PROTECT_CONFIDENCE = 88
+#: Region (layout-bucket) evidence needs more support than text evidence:
+#: a bucket is far coarser than a token set, so three clicks that happen to
+#: share a size class must not condemn every notice of that size.
+REGION_MIN_SUPPORT = 4
+#: What one fully-condemned region bucket contributes to the demote score.
+#: Deliberately below DEMOTE_SCORE: layout alone never demotes, it can only
+#: tip a candidate that already carries some learned text evidence.
+REGION_WEIGHT_CAP = 0.9
+LEARNING_HISTORY_FILENAME = "learning_history.jsonl"
 
 
 def _path(name: str) -> str:
@@ -104,6 +113,8 @@ def record(result, verdict: str, origin: str = "results") -> dict:
         "ocr_text": text[:4000],
         "normalized_text": core.normalize_ocr_text(text)[:4000],
         "image_hash": image_fingerprint(getattr(result, "image_bgr", None)),
+        "crop_w": _crop_size(result)[0],
+        "crop_h": _crop_size(result)[1],
         "classifier_score": getattr(result, "confidence", 0),
         "classifier_method": getattr(result, "method", ""),
         "classifier_version": learned_version(),
@@ -149,6 +160,47 @@ def counts() -> Tuple[int, int]:
 
 # --- learning -----------------------------------------------------------------
 
+def _crop_size(result) -> Tuple[int, int]:
+    """(width, height) of the crop the user judged, 0 when unknown."""
+    image = getattr(result, "image_bgr", None)
+    try:
+        height, width = image.shape[:2]
+        return int(width), int(height)
+    except Exception:
+        return 0, 0
+
+
+def _method_base(method: str) -> str:
+    """The detection path without its refinement suffixes: 'box+template?',
+    'box+template+col', 'box+template+split' are all the same evidence about
+    WHERE a detection came from."""
+    return (method or "").replace("?", "").split("+col")[0].split("+split")[0]
+
+
+def _region_bucket(source: str, method: str, width: int, height: int
+                   ) -> Optional[str]:
+    """Coarse layout class of one judged crop, or None when unknown.
+
+    Deliberately coarse: newspaper + detection path + size class + shape
+    class.  Fine enough that 'the small square photo ads Sandesh's page-scan
+    keeps finding' is one bucket, coarse enough that a handful of clicks can
+    ever fill one."""
+    if not source or not width or not height:
+        return None
+    size = "s" if width < 400 else "m" if width < 750 else \
+        "l" if width < 1200 else "xl"
+    aspect = height / float(width)
+    shape = "wide" if aspect < 0.6 else "tall" if aspect > 1.5 else "box"
+    return f"{source}|{_method_base(method)}|{size}|{shape}"
+
+
+def _record_bucket(entry: dict) -> Optional[str]:
+    return _region_bucket(entry.get("source", ""),
+                          entry.get("classifier_method", ""),
+                          int(entry.get("crop_w") or 0),
+                          int(entry.get("crop_h") or 0))
+
+
 def _tokens(normalized: str) -> set:
     """Overlapping fragments of the normalised text.
 
@@ -191,6 +243,39 @@ def build_model(records: Optional[Sequence[dict]] = None) -> dict:
         # Log so the tenth rejection adds less than the third: evidence
         # accumulates, it does not multiply.
         weights[token] = round(math.log1p(negatives - positives) , 4)
+    # The mirror image: what the user keeps CONFIRMING.  Same guard rails.
+    # Used only to lift a Not Sure crop into the results (should_promote) -
+    # never to create a detection, and never to outvote negative evidence.
+    positive_weights: Dict[str, float] = {}
+    for token, positives in pos_count.items():
+        if positives < MIN_SUPPORT:
+            continue
+        negatives = neg_count.get(token, 0)
+        if negatives and positives / float(negatives) < MIN_RATIO:
+            continue
+        positive_weights[token] = round(math.log1p(positives - negatives), 4)
+
+    # Layout evidence: which (newspaper, path, size, shape) classes the user
+    # keeps rejecting.  Text tokens miss the ads whose OCR is garbage - the
+    # layout class is often the only stable thing about them.
+    region_neg: Dict[str, int] = {}
+    region_pos: Dict[str, int] = {}
+    for bucket_counts, docs in ((region_neg, negative_docs),
+                                (region_pos, positive_docs)):
+        for entry in docs:
+            bucket = _record_bucket(entry)
+            if bucket:
+                bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
+    region_weights: Dict[str, float] = {}
+    for bucket, negatives in region_neg.items():
+        if negatives < REGION_MIN_SUPPORT:
+            continue
+        positives = region_pos.get(bucket, 0)
+        if positives and negatives / float(positives) < MIN_RATIO:
+            continue
+        region_weights[bucket] = round(
+            min(REGION_WEIGHT_CAP,
+                REGION_WEIGHT_CAP * (negatives - positives) / 8.0), 4)
 
     return {
         "version": 1,
@@ -198,6 +283,8 @@ def build_model(records: Optional[Sequence[dict]] = None) -> dict:
         "positive_examples": len(positive_docs),
         "negative_examples": len(negative_docs),
         "weights": weights,
+        "positive_weights": positive_weights,
+        "region_weights": region_weights,
         "metrics": {},
     }
 
@@ -270,23 +357,147 @@ def rollback() -> Optional[dict]:
     return previous
 
 
+def evaluate(model: dict, records: Sequence[dict]) -> dict:
+    """How this model would have ruled on the user's own verdicts.  Pure.
+
+    A demote of a confirmed-negative is the reward; a demote of a
+    confirmed-positive is the injury.  `recall` is over confirmed positives:
+    the fraction the model would have LEFT ALONE."""
+    demoted_neg = demoted_pos = positives = negatives = 0
+    promoted_neg = promoted_pos = 0
+    for entry in records:
+        text = entry.get("normalized_text", "")
+        text_points = score(text, model)
+        bucket = _record_bucket(entry)
+        region_points = (model.get("region_weights") or {}).get(bucket, 0.0) \
+            if bucket else 0.0
+        confident = float(entry.get("classifier_score") or 0) \
+            >= PROTECT_CONFIDENCE
+        demoted = not confident and \
+            (text_points + region_points) >= DEMOTE_SCORE
+        promoted = entry.get("origin") == "review" and text_points == 0 \
+            and score(text, model, "positive_weights") >= PROMOTE_SCORE
+        if entry.get("feedback") == "positive":
+            positives += 1
+            demoted_pos += 1 if demoted else 0
+            promoted_pos += 1 if promoted else 0
+        else:
+            negatives += 1
+            demoted_neg += 1 if demoted else 0
+            promoted_neg += 1 if promoted else 0
+    recall = 1.0 if not positives else (positives - demoted_pos) / positives
+    return {
+        "positives": positives, "negatives": negatives,
+        "caught_negatives": demoted_neg, "hurt_positives": demoted_pos,
+        "promoted_positives": promoted_pos,
+        "promoted_negatives": promoted_neg,
+        "recall_on_confirmed": round(recall, 4),
+        # A caught negative and a rightly promoted positive are the reward;
+        # a hidden real notice costs three times as much - recall is the
+        # contract - and a promoted piece of noise costs one.
+        "reward": demoted_neg + promoted_pos - 3 * demoted_pos - promoted_neg,
+    }
+
+
+def _loo_injuries(records: Sequence[dict]) -> Tuple[int, int]:
+    """Leave-one-out injury counts: (positives a model built WITHOUT them
+    would demote, negatives such a model would promote).  Resubstitution
+    can't answer that - a record's own tokens shield it while it is in the
+    build set.  Records are few (user clicks), so the rebuilds are cheap."""
+    held = [r for r in records if r.get("feedback") in ("positive",
+                                                          "negative")]
+    if len(records) > 400:            # ponytail: cap, sample the newest
+        held = held[-120:]
+    hurt = promoted = 0
+    for entry in held:
+        rest = [r for r in records if r is not entry]
+        out = evaluate(build_model(rest), [entry])
+        hurt += out["hurt_positives"]
+        promoted += out["promoted_negatives"]
+    return hurt, promoted
+
+
+def _log_history(entry: dict) -> None:
+    entry = dict(entry, timestamp=time.strftime("%Y-%m-%dT%H:%M:%S"))
+    try:
+        with open(_path(LEARNING_HISTORY_FILENAME), "a",
+                  encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
 def relearn() -> dict:
-    """Rebuild from all evidence and save.  Called after each new record."""
-    return save_model(build_model())
+    """Rebuild from all evidence, validate, and save ONLY if the update
+    cannot hurt a notice the user confirmed as real.
+
+    The gate is the recall guard applied to learning itself: a candidate
+    model that would demote any confirmed positive (tested leave-one-out,
+    so a positive cannot protect itself) is HELD - the evidence stays in
+    feedback.jsonl and the previous model keeps ruling.  Every decision is
+    appended to learning_history.jsonl so improvement is measurable."""
+    records = load_records()
+    candidate = build_model(records)
+    metrics = evaluate(candidate, records)
+    has_rules = any(candidate.get(k) for k in
+                    ("weights", "positive_weights", "region_weights"))
+    hurt_loo, promoted_loo = _loo_injuries(records) if has_rules else (0, 0)
+    metrics["hurt_positives_loo"] = hurt_loo
+    metrics["promoted_negatives_loo"] = promoted_loo
+
+    current = load_model()
+    keep = hurt_loo == 0 and metrics["hurt_positives"] == 0 and \
+        promoted_loo == 0 and metrics["promoted_negatives"] == 0
+    _log_history({
+        "candidate_rules": len(candidate.get("weights", {})),
+        "candidate_positive_rules": len(candidate.get("positive_weights", {})),
+        "candidate_region_rules": len(candidate.get("region_weights", {})),
+        "metrics": metrics,
+        "decision": "KEEP" if keep else "HOLD",
+        "previous_version": current.get("version", 0),
+    })
+    if not keep:
+        return current                # the click is stored; the model waits
+    candidate["metrics"] = metrics
+    return save_model(candidate)
 
 
 # --- applying it --------------------------------------------------------------
 
-def score(normalized_text: str, model: Optional[dict] = None) -> float:
-    """How much learned NEGATIVE evidence this text carries.  0.0 = none."""
+def score(normalized_text: str, model: Optional[dict] = None,
+          key: str = "weights") -> float:
+    """How much learned evidence this text carries - NEGATIVE by default,
+    positive with key="positive_weights".  0.0 = none."""
     model = load_model() if model is None else model
-    weights = model.get("weights") or {}
+    weights = model.get(key) or {}
     if not weights or not normalized_text:
         return 0.0
     total = 0.0
     for token in _tokens(normalized_text):
         total += weights.get(token, 0.0)
     return round(total, 4)
+
+
+#: Positive evidence a Not Sure crop needs before it skips the queue.
+PROMOTE_SCORE = 2.0
+
+
+def should_promote(result, model: Optional[dict] = None) -> bool:
+    """Has this Not Sure crop earned its way INTO the results?
+
+    Only crops already in the review queue, only when the learned positive
+    evidence is strong and there is NO learned negative evidence at all.
+    Promotion never creates a detection - it moves one the detector already
+    made from one list to the other, and a wrong promotion is one Not
+    Related click away (which then teaches the opposite)."""
+    if not getattr(result, "needs_review", False) or \
+            not getattr(result, "ocr_done", False):
+        return False
+    model = load_model() if model is None else model
+    text = getattr(result, "normalized_ocr", "") or ""
+    if score(text, model) > 0:
+        return False
+    return score(text, model, "positive_weights") >= PROMOTE_SCORE
 
 
 def should_demote(result, model: Optional[dict] = None) -> bool:
@@ -304,27 +515,36 @@ def should_demote(result, model: Optional[dict] = None) -> bool:
     if getattr(result, "confidence", 0) >= PROTECT_CONFIDENCE:
         return False
     model = load_model() if model is None else model
-    return score(getattr(result, "normalized_ocr", "") or "", model) \
-        >= DEMOTE_SCORE
+    points = score(getattr(result, "normalized_ocr", "") or "", model)
+    width, height = _crop_size(result)
+    bucket = _region_bucket(getattr(result, "newspaper", ""),
+                            getattr(result, "method", ""), width, height)
+    if bucket:
+        points += (model.get("region_weights") or {}).get(bucket, 0.0)
+    return points >= DEMOTE_SCORE
 
 
 # --- self-check ---------------------------------------------------------------
 
 class _Result:
-    def __init__(self, text, confidence=70, done=True):
+    def __init__(self, text, confidence=70, done=True, size=None,
+                 newspaper="Gujarat Samachar", method="box+template"):
         from .. import core
         self.ocr_text = text
         self.normalized_ocr = core.normalize_ocr_text(text)
         self.confidence = confidence
         self.ocr_done = done
         self.result_id = 1
-        self.newspaper = "Gujarat Samachar"
+        self.newspaper = newspaper
         self.page_number = 4
         self.edition = "ahmedabad"
         self.issue_date = "2026-08-12"
         self.notice_type = "notice"
-        self.method = "box+template"
+        self.method = method
         self.image_bgr = None
+        if size is not None:
+            import numpy as np
+            self.image_bgr = np.zeros((size[1], size[0], 3), dtype="uint8")
 
 
 def demo() -> None:
@@ -391,7 +611,62 @@ def demo() -> None:
     positive, negative = counts()
     assert positive == 4 and negative == MIN_SUPPORT + 1, (positive, negative)
 
-    for f in (path, learned):
+    # Region learning: repeated rejections of one layout class (different,
+    # garbage text each time - the OCR-noise ad case) become bucket evidence.
+    for index in range(REGION_MIN_SUPPORT):
+        record(_Result(f"zxq{index} qqwx{index} vv{index}", size=(300, 300),
+                       newspaper="Sandesh", method="page-scan"), "negative")
+    model = build_model()
+    assert model["region_weights"], "layout rejections taught nothing"
+    # ...but layout alone can never demote (its cap < DEMOTE_SCORE).
+    fresh_ad = _Result("totally new words here", size=(310, 290),
+                       newspaper="Sandesh", method="page-scan")
+    save_model(model)
+    assert not should_demote(fresh_ad, load_model()), \
+        "layout evidence alone demoted a crop"
+
+    # The relearn gate: a model that would demote a confirmed POSITIVE is
+    # held, not saved.  Five rejections and one confirmation of the same
+    # text - leave-one-out shows the model would hurt that positive.
+    trap = "mango festival gift city special stalls booking open today"
+    for _ in range(5):
+        record(_Result(trap), "negative")
+    record(_Result(trap), "positive")
+    before = load_model().get("version", 0)
+    ruled = relearn()
+    history_path = _path(LEARNING_HISTORY_FILENAME)
+    assert os.path.exists(history_path), "no learning history written"
+    last = json.loads(open(history_path,
+                           encoding="utf-8").readlines()[-1])
+    assert last["decision"] == "HOLD", last
+    assert ruled.get("version", 0) == before, "a harmful model was saved"
+
+    # Positive learning: repeated confirmations of a KIND lift a similar
+    # Not Sure crop into the results - and only a Not Sure crop.
+    for f in (path, learned, history_path):
+        if os.path.exists(f):
+            os.remove(f)
+    court = ("public notice in the court of the civil judge senior division "
+             "notice to defendant suit number")
+    for _ in range(MIN_SUPPORT + 1):
+        record(_Result(court + " ahmedabad"), "positive", "review")
+    model = build_model()
+    assert model["positive_weights"], "repeated confirmations taught nothing"
+    unsure = _Result("public notice in the court of the civil judge "
+                     "senior division notice to defendant gandhinagar",
+                     confidence=64)
+    unsure.needs_review = True
+    assert should_promote(unsure, model), "a confirmed kind stayed in review"
+    settled = _Result(court, confidence=64)          # not in the queue
+    settled.needs_review = False
+    assert not should_promote(settled, model)
+    # ...and never against negative evidence: the same words rejected too.
+    for _ in range(MIN_SUPPORT + 1):
+        record(_Result(court + " ahmedabad"), "negative", "review")
+    model = build_model()
+    assert not model["positive_weights"], "contested words became a rule"
+
+    for f in (path, learned, history_path):
         if os.path.exists(f):
             os.remove(f)
     print("feedback self-check OK")

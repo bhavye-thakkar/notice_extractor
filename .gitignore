@@ -25,3 +25,7 @@ venv/
 .idea/
 Thumbs.db
 desktop.ini
+# Ground-truth annotations for the accuracy harness (tools/measure_validation.py).
+# Machine-local: they describe one day's captured pages, which are not in the
+# repo either.  Re-create by capturing an edition and annotating it.
+tools/validation/
