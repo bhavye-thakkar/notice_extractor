@@ -68,6 +68,28 @@ REGION_MIN_SUPPORT = 4
 REGION_WEIGHT_CAP = 0.9
 LEARNING_HISTORY_FILENAME = "learning_history.jsonl"
 
+# --- segmentation (Half Copy) -------------------------------------------------
+# A SECOND, independent learner.  "Not Related" says the app returned the
+# wrong thing; "Half Copy" says it returned the RIGHT thing badly cropped.
+# Mixing them is the mistake this file exists to avoid: training a half crop
+# as a negative would teach the classifier to reject the very notices it is
+# supposed to find, which costs recall - the one thing that may never drop.
+#
+# So a half_crop record carries BOTH signals, on purpose:
+#     relevance   -> positive   (this IS a notice)
+#     segmentation-> negative   (this crop was incomplete)
+SEGMENT_FILENAME = "segmentation.json"
+#: How many half-crop reports of one layout bucket + direction before the
+#: hint is applied to future runs.  Two, not one: a single click is an
+#: anecdote, and this hint makes crops BIGGER, which can merge neighbours.
+SEGMENT_MIN_SUPPORT = 2
+#: Cap on how far a learned hint may grow a crop, as a fraction of its own
+#: height/width.  A hint is a nudge towards the next ruling line, never a
+#: licence to swallow the column.
+SEGMENT_MAX_GROWTH = 0.9
+#: Ink coverage that counts as "there is more of this notice here".
+SEGMENT_INK_MIN = 0.02
+
 
 def _path(name: str) -> str:
     from .. import config
@@ -154,7 +176,8 @@ def load_records() -> List[dict]:
 def counts() -> Tuple[int, int]:
     """(positive, negative) - what the UI shows next to the review queue."""
     records = load_records()
-    positive = sum(1 for r in records if r["feedback"] == "positive")
+    positive = sum(1 for r in records
+                   if r["feedback"] in ("positive", "half_crop"))
     return positive, len(records) - positive
 
 
@@ -224,7 +247,13 @@ def build_model(records: Optional[Sequence[dict]] = None) -> dict:
     measured against held-out records before anything is saved."""
     records = load_records() if records is None else records
     negative_docs = [r for r in records if r["feedback"] == "negative"]
-    positive_docs = [r for r in records if r["feedback"] == "positive"]
+    # A half crop is a POSITIVE here.  The user said "this is the right
+    # notice, badly cut" - training it as a negative would teach the
+    # classifier to reject real notices, and recall is the one number that
+    # may not drop.  The cropping half of that click is learned separately,
+    # in the segmentation model.
+    positive_docs = [r for r in records
+                     if r["feedback"] in ("positive", "half_crop")]
 
     neg_count: Dict[str, int] = {}
     pos_count: Dict[str, int] = {}
@@ -377,7 +406,7 @@ def evaluate(model: dict, records: Sequence[dict]) -> dict:
             (text_points + region_points) >= DEMOTE_SCORE
         promoted = entry.get("origin") == "review" and text_points == 0 \
             and score(text, model, "positive_weights") >= PROMOTE_SCORE
-        if entry.get("feedback") == "positive":
+        if entry.get("feedback") in ("positive", "half_crop"):
             positives += 1
             demoted_pos += 1 if demoted else 0
             promoted_pos += 1 if promoted else 0
@@ -405,7 +434,8 @@ def _loo_injuries(records: Sequence[dict]) -> Tuple[int, int]:
     can't answer that - a record's own tokens shield it while it is in the
     build set.  Records are few (user clicks), so the rebuilds are cheap."""
     held = [r for r in records if r.get("feedback") in ("positive",
-                                                          "negative")]
+                                                       "negative",
+                                                       "half_crop")]
     if len(records) > 400:            # ponytail: cap, sample the newest
         held = held[-120:]
     hurt = promoted = 0
@@ -460,6 +490,267 @@ def relearn() -> dict:
         return current                # the click is stored; the model waits
     candidate["metrics"] = metrics
     return save_model(candidate)
+
+
+# --- segmentation learning (Half Copy) ----------------------------------------
+
+def _segment_bucket(source: str, method: str, width: int, height: int,
+                    page_size: Sequence = ()) -> Optional[str]:
+    """Layout class for a CROP, for segmentation learning.
+
+    Deliberately not the image hash - "this exact picture was bad"
+    generalises to nothing.  Newspaper + detection path + shape + which
+    third of the page column it sits in is a pattern that recurs across
+    editions, which is what makes "Sandesh box+ocr crops in this shape are
+    usually cut short" learnable at all."""
+    base = _region_bucket(source, method, width, height)
+    if not base:
+        return None
+    try:
+        page_w = int(page_size[0]) or 0
+    except (TypeError, IndexError, ValueError):
+        page_w = 0
+    column = "?" if not page_w else str(int(3.0 * width / page_w))
+    return f"{base}|col{column}"
+
+
+def _edges_on_rules(gray, rect: Sequence) -> Dict[str, bool]:
+    """Which of a rect's four edges sit on a printed ruling line.
+
+    Uses the detector's own line masks, so "is there a border here?" is
+    answered exactly the way segmentation answered it when it made the
+    crop."""
+    from .. import core
+    import numpy as np
+
+    x, y, w, h = (int(v) for v in rect)
+    detector = core.BoxCandidateDetector(core.DETECTION_CONFIG)
+    detector.compute_line_masks(gray)
+    hmask, vmask = detector.horizontal_mask, detector.vertical_mask
+    page_h, page_w = gray.shape[:2]
+    tol = 5                       # a printed rule is a few pixels thick
+
+    def horizontal(edge_y: int) -> bool:
+        lo = max(0, edge_y - tol)
+        hi = min(page_h, edge_y + tol + 1)
+        seg = hmask[lo:hi, max(0, x):min(page_w, x + w)]
+        if seg.size == 0:
+            return True           # off the page: as good as a border
+        return float(np.count_nonzero(seg.max(axis=0))) / max(1, w) >= 0.45
+
+    def vertical(edge_x: int) -> bool:
+        lo = max(0, edge_x - tol)
+        hi = min(page_w, edge_x + tol + 1)
+        seg = vmask[max(0, y):min(page_h, y + h), lo:hi]
+        if seg.size == 0:
+            return True
+        return float(np.count_nonzero(seg.max(axis=1))) / max(1, h) >= 0.45
+
+    return {"top": horizontal(y), "bottom": horizontal(y + h),
+            "left": vertical(x), "right": vertical(x + w)}
+
+
+def missing_direction(gray, rect: Sequence,
+                      page_size: Sequence = ()) -> str:
+    """Which way a crop was cut short: 'bottom', 'top', 'right', 'left',
+    'multiple' or 'unknown'.
+
+    Read off the PAGE, not guessed: for each edge, look at the band just
+    outside the crop, the width (or height) of the crop itself, and ask
+    whether printed ink continues there.  A notice that ends properly is
+    followed by white space or a ruling line; one that was cut short is
+    followed by more of its own text.
+
+    `gray` is the page in the same (working) scale as `rect`."""
+    try:
+        import numpy as np
+        x, y, w, h = (int(v) for v in rect)
+    except (TypeError, ValueError):
+        return "unknown"
+    if gray is None or w <= 0 or h <= 0:
+        return "unknown"
+    page_h, page_w = gray.shape[:2]
+    band = max(10, int(min(w, h) * 0.12))
+
+    def ink(region) -> float:
+        if region is None or region.size == 0:
+            return 0.0
+        return float(np.count_nonzero(region < 128)) / region.size
+
+    edges = {
+        "top": gray[max(0, y - band):max(0, y), x:min(page_w, x + w)],
+        "bottom": gray[min(page_h, y + h):min(page_h, y + h + band),
+                       x:min(page_w, x + w)],
+        "left": gray[y:min(page_h, y + h), max(0, x - band):max(0, x)],
+        "right": gray[y:min(page_h, y + h),
+                      min(page_w, x + w):min(page_w, x + w + band)],
+    }
+    # "Is there ink just outside?" is NOT the question - on a notice-board
+    # page there is always ink just outside, because the next notice is
+    # there.  Measured on 30 real Sandesh crops, that test alone called 28
+    # of 30 COMPLETE crops short.
+    #
+    # The question is whether this crop ENDS somewhere.  A complete notice
+    # stops at its own printed border; a crop cut short stops in the middle
+    # of the text with no rule under it.  So an edge sitting on a ruling
+    # line is complete whatever lies beyond it, and only an edge with no
+    # rule AND text carrying on past it counts as short.
+    ruled = _edges_on_rules(gray, (x, y, w, h))
+    inside = ink(gray[y:y + h, x:x + w])
+    floor = max(SEGMENT_INK_MIN, inside * 0.35)
+    hits = [name for name, region in edges.items()
+            if not ruled.get(name) and ink(region) >= floor]
+    if not hits:
+        return "unknown"
+    if len(hits) > 1:
+        # Bottom wins when it is one of them: Gujarati notices run down the
+        # column, so a crop that is short is nearly always short at the
+        # bottom, and expanding one way is safer than expanding two.
+        return "bottom" if "bottom" in hits else "multiple"
+    return hits[0]
+
+
+def load_segmentation() -> dict:
+    try:
+        with open(_path(SEGMENT_FILENAME), encoding="utf-8") as handle:
+            model = json.load(handle)
+    except (OSError, ValueError):
+        model = {}
+    if not isinstance(model, dict):
+        model = {}
+    model.setdefault("version", 0)
+    model.setdefault("buckets", {})
+    model.setdefault("half_crops", 0)
+    model.setdefault("confirmed", 0)
+    return model
+
+
+def _save_segmentation(model: dict) -> dict:
+    path = _path(SEGMENT_FILENAME)
+    temporary = path + ".tmp"
+    try:
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(model, handle, ensure_ascii=False, indent=1)
+        os.replace(temporary, path)
+    except OSError:
+        try:
+            os.remove(temporary)
+        except OSError:
+            pass
+    return model
+
+
+def record_half_crop(result, direction: str = "unknown",
+                     page_size: Sequence = ()) -> dict:
+    """One Half Copy click: the crop was incomplete, the notice was right.
+
+    Writes to the SAME evidence file as every other click (one history, one
+    place to audit) with feedback "half_crop", and updates the segmentation
+    model.  The classifier reads it as a POSITIVE - see the note at the top
+    of this section."""
+    from . import search as search_util
+    from .. import core
+
+    width, height = _crop_size(result)
+    entry = record(result, "half_crop", origin="results")
+    entry.update({
+        "direction": direction,
+        "crop": {"x": int(getattr(result, "page_rect", (0, 0, 0, 0))[0]),
+                 "y": int(getattr(result, "page_rect", (0, 0, 0, 0))[1]),
+                 "width": int(getattr(result, "page_rect", (0, 0, 0, 0))[2]),
+                 "height": int(getattr(result, "page_rect", (0, 0, 0, 0))[3])},
+        "crop_pixels": {"width": width, "height": height},
+        "page_dimensions": {"width": int(page_size[0]) if page_size else 0,
+                            "height": int(page_size[1]) if page_size else 0},
+        "segmentation_version": load_segmentation().get("version", 0),
+    })
+    # Rewrite the last line with the richer record: record() already wrote a
+    # plain one, and the evidence file must hold ONE row per click.
+    _replace_last_record(entry)
+
+    model = load_segmentation()
+    bucket = _segment_bucket(getattr(result, "newspaper", ""),
+                             getattr(result, "method", ""), width, height,
+                             page_size)
+    if bucket:
+        stats = model["buckets"].setdefault(
+            bucket, {"directions": {}, "half": 0, "ok": 0})
+        stats["directions"][direction] = \
+            stats["directions"].get(direction, 0) + 1
+        stats["half"] = stats.get("half", 0) + 1
+    model["half_crops"] = int(model.get("half_crops", 0)) + 1
+    model["version"] = int(model.get("version", 0)) + 1
+    _save_segmentation(model)
+    return entry
+
+
+def record_crop_confirmed(result) -> None:
+    """A crop the user confirmed as right (This Is Right in Not Sure).
+
+    The positive half of the segmentation reward: a bucket that keeps being
+    confirmed must not drift into "always expand" because of two old half
+    crops."""
+    model = load_segmentation()
+    bucket = _segment_bucket(getattr(result, "newspaper", ""),
+                             getattr(result, "method", ""),
+                             *_crop_size(result),
+                             getattr(result, "page_size", ()))
+    if bucket:
+        stats = model["buckets"].setdefault(
+            bucket, {"directions": {}, "half": 0, "ok": 0})
+        stats["ok"] = stats.get("ok", 0) + 1
+    model["confirmed"] = int(model.get("confirmed", 0)) + 1
+    _save_segmentation(model)
+
+
+def _replace_last_record(entry: dict) -> None:
+    """Swap the final line of the evidence file for `entry` (same id)."""
+    path = _path(FEEDBACK_FILENAME)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            lines = handle.readlines()
+        while lines and not lines[-1].strip():
+            lines.pop()
+        if not lines:
+            return
+        lines[-1] = json.dumps(entry, ensure_ascii=False) + "\n"
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.writelines(lines)
+    except OSError:
+        pass
+
+
+def expansion_hint(newspaper: str, method: str, width: int, height: int,
+                   page_size: Sequence = ()) -> str:
+    """Which way crops of this layout class have been reported short.
+
+    Returns a direction, or "" when there is not enough agreeing evidence.
+    Two guards, both about not making things worse: the bucket needs
+    SEGMENT_MIN_SUPPORT reports of the SAME direction, and a bucket whose
+    crops have been confirmed correct at least as often as reported short
+    gets no hint at all."""
+    model = load_segmentation()
+    bucket = _segment_bucket(newspaper, method, width, height, page_size)
+    stats = (model.get("buckets") or {}).get(bucket or "")
+    if not stats:
+        return ""
+    if int(stats.get("ok", 0)) >= int(stats.get("half", 0)):
+        return ""
+    directions = stats.get("directions") or {}
+    if not directions:
+        return ""
+    best = max(directions, key=lambda key: directions[key])
+    if best in ("unknown", "multiple"):
+        return ""
+    return best if directions[best] >= SEGMENT_MIN_SUPPORT else ""
+
+
+def half_crop_rate() -> Tuple[int, int, float]:
+    """(half crops, notices judged, rate) - what §29 asks to be tracked."""
+    records = load_records()
+    half = sum(1 for r in records if r.get("feedback") == "half_crop")
+    total = len(records)
+    return half, total, (half / total if total else 0.0)
 
 
 # --- applying it --------------------------------------------------------------

@@ -72,6 +72,7 @@ import os
 import re
 import io
 import sys
+import errno
 import glob
 import json
 import time
@@ -557,6 +558,29 @@ HTTP_TIMEOUT_SECONDS = 25
 HTTP_RETRIES = 2
 HTTP_RETRY_DELAY_SECONDS = 1.5
 
+# --- download cache & disk safety --------------------------------------------
+# The page cache used to be a per-downloader tempfile.mkdtemp(), which on
+# Windows means C:\Users\...\Temp.  Three real failures came out of that:
+#
+#   * "[Errno 28] No space left on device" - measured on this machine, C: had
+#     3.5 GB free of 280 GB while the app's own drive had 115 GB free.  The
+#     app wrote every page to the FULL drive.
+#   * "Full-size image unavailable; falling back to the preview render" - the
+#     same disk error, one level up: the full-size fetch failed on the cache
+#     WRITE, so the app quietly downgraded itself to preview renders.
+#   * ten leftover pne_cache_* folders: cleanup ran from atexit, which does
+#     not run when an agent is killed on timeout.
+#
+# So: ONE cache, next to the app's own data (same drive as the program), shared
+# by every agent (ahmedabad and ahmedabad-east publish byte-identical notice
+# pages - with a per-agent cache each one downloaded them separately), swept
+# on startup and bounded by size.
+CACHE_MAX_BYTES = 2 * 1024 * 1024 * 1024      # 2 GB of cached pages
+#: Refuse to start a run with less than this free, and keep this much free
+#: while running (a full edition of 22 pages is ~35 MB, so this is generous).
+DISK_MIN_FREE_BYTES = 500 * 1024 * 1024
+
+
 # --- concurrency -------------------------------------------------------------
 # Every edition runs as its own agent, all of them at once.  An edition spends
 # most of its life waiting on the newspaper's server, so the agent count is
@@ -613,7 +637,22 @@ DETECT_CONCURRENCY = max(2, min(8, (_CPUS * 3) // 8))
 CV2_THREADS_PER_DETECT = max(2, round(_CPUS / DETECT_CONCURRENCY))
 # Wall-clock budget for one edition agent before it is abandoned, and how many
 # times a failed agent is retried (network flakiness is the common cause).
-AGENT_TIMEOUT_SECONDS = 900
+# An agent is abandoned when it STOPS MAKING PROGRESS, not when the batch has
+# been running a while.  The old code set one deadline for the whole batch and
+# killed everything still running when it expired: two different newspapers
+# reported "TIMEOUT after 900s" in the same second, both of them mid-edition
+# and both still finding notices.  A page that finishes (or a notice that is
+# published) resets the clock, so a slow edition finishes and only a genuinely
+# stuck one is dropped.
+#
+# 240 s is ~4x the slowest single page measured (a 22-page Sandesh edition
+# replays in ~230 s in total, worst page ~36 s before this session's
+# optimisations, ~16 s after).
+AGENT_STALL_SECONDS = 240
+#: Absolute ceiling per agent, as a backstop for an edition that keeps making
+#: microscopic progress forever.  Generous on purpose - it is not the
+#: mechanism, the stall watchdog is.
+AGENT_TIMEOUT_SECONDS = 2400
 AGENT_RETRIES = 1
 
 
@@ -2354,6 +2393,129 @@ class ExtractionError(Exception):
     """A fatal, user-presentable extraction problem."""
 
 
+
+class DiskFullError(ExtractionError):
+    """Out of disk space.  A distinct class because it must NOT be retried:
+    three attempts at writing to a full disk fail three times, slowly."""
+
+
+def free_bytes(path: str) -> int:
+    try:
+        return shutil.disk_usage(path).free
+    except OSError:
+        return DISK_MIN_FREE_BYTES          # unknown: do not block the run
+
+
+def cache_dir() -> str:
+    """The one shared page cache, on the app's own drive."""
+    from . import config
+    return config.data_path("cache")
+
+
+def cache_bytes() -> int:
+    total = 0
+    try:
+        with os.scandir(cache_dir()) as entries:
+            for entry in entries:
+                try:
+                    total += entry.stat().st_size
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return total
+
+
+def evict_cache(target_bytes: int = CACHE_MAX_BYTES) -> int:
+    """Delete the least-recently-used cached pages until the cache is under
+    `target_bytes`.  Returns the bytes freed.  Only ever touches data/cache -
+    saved notices, feedback and learning live elsewhere and are never
+    candidates."""
+    try:
+        with os.scandir(cache_dir()) as entries:
+            files = []
+            for entry in entries:
+                try:
+                    stat = entry.stat()
+                except OSError:
+                    continue
+                if entry.is_file():
+                    files.append((stat.st_atime, stat.st_size, entry.path))
+    except OSError:
+        return 0
+    total = sum(size for _atime, size, _path in files)
+    freed = 0
+    for _atime, size, path in sorted(files):        # oldest access first
+        if total - freed <= target_bytes:
+            break
+        try:
+            os.remove(path)
+            freed += size
+        except OSError:
+            pass
+    return freed
+
+
+def sweep_stale_caches() -> int:
+    """Remove pne_cache_* folders left in the system temp by older versions
+    (and by any run that was killed before atexit could fire)."""
+    freed = 0
+    try:
+        base = tempfile.gettempdir()
+        for name in os.listdir(base):
+            if not name.startswith("pne_cache_"):
+                continue
+            path = os.path.join(base, name)
+            try:
+                for root, _dirs, files in os.walk(path):
+                    for file in files:
+                        try:
+                            freed += os.path.getsize(os.path.join(root, file))
+                        except OSError:
+                            pass
+                shutil.rmtree(path, ignore_errors=True)
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return freed
+
+
+def ensure_disk_space(log: Optional[Callable[[str, str], None]] = None
+                      ) -> None:
+    """Called before a run: make room, and refuse clearly if there is none.
+
+    Order matters - free what is safe to free BEFORE deciding the run cannot
+    happen, and never delete anything but caches."""
+    def say(text: str, tag: str = "dim") -> None:
+        if log is not None:
+            log(text, tag)
+
+    stale = sweep_stale_caches()
+    if stale:
+        say(f"Cleaned {human_bytes(stale)} of leftover cache folders.")
+    if cache_bytes() > CACHE_MAX_BYTES:
+        freed = evict_cache()
+        if freed:
+            say(f"Cache over {human_bytes(CACHE_MAX_BYTES)}: freed "
+                f"{human_bytes(freed)}.")
+    free = free_bytes(cache_dir())
+    if free >= DISK_MIN_FREE_BYTES:
+        return
+    freed = evict_cache(0)                  # last resort: drop the lot
+    if freed:
+        say(f"Low disk space: cleared {human_bytes(freed)} of cached pages.",
+            "warn")
+    free = free_bytes(cache_dir())
+    if free < DISK_MIN_FREE_BYTES:
+        raise DiskFullError(
+            f"Only {human_bytes(free)} free on the drive holding "
+            f"{cache_dir()}.\nThe extractor needs about "
+            f"{human_bytes(DISK_MIN_FREE_BYTES)} for the pages it downloads."
+            "\n\nFree some space and try again - no notices, feedback or "
+            "settings were touched.")
+
+
 def clamp(value, lo, hi):
     return max(lo, min(hi, value))
 
@@ -3262,6 +3424,18 @@ class NoticeResult:
     #: True while this notice is in the Not Sure queue rather than the
     #: results list - see GalleryPanel.review_results().
     needs_review: bool = False
+    #: Where this crop came from on its page, in DETECTION (working-scale)
+    #: pixels, plus that page's size and URL.  Three small numbers instead of
+    #: the 22 MB page: enough to ask "what is just below this crop?" later
+    #: (Half Copy) by re-reading the page from the download cache, which the
+    #: run has already filled.  (0, 0, 0, 0) = a result from before this
+    #: existed, or one the source cannot re-open.
+    page_rect: Tuple[int, int, int, int] = (0, 0, 0, 0)
+    page_size: Tuple[int, int] = (0, 0)
+    page_url: str = ""
+    #: True once Half Copy re-cropped this result, so the card can say so and
+    #: a second click does not re-run the same expansion.
+    recropped: bool = False
     #: The 210px gallery thumbnail, built ONCE on the worker thread that
     #: found the notice (ensure_thumbnail).  The gallery used to LANCZOS-
     #: resize the full crop on the Tk thread for EVERY card build - measured
@@ -3367,7 +3541,12 @@ class PageDownloader:
 
     def __init__(self, reporter: ProgressReporter):
         self._reporter = reporter
-        self._cache_dir = tempfile.mkdtemp(prefix="pne_cache_")
+        # ONE cache for the whole app, on the app's own drive - see the
+        # "download cache & disk safety" note above for the three production
+        # failures the old per-agent temp folder caused.  Shared between
+        # agents on purpose: two editions of the same paper publish the same
+        # notice pages, and they used to be downloaded once per agent.
+        self._cache_dir = cache_dir()
         # Bounded, and small on purpose.  A decoded newspaper page is ~22 MB
         # (2300x3200x3), each agent walks its whole edition once, and every
         # agent has its own downloader: an unbounded cache meant 18 pages x 8
@@ -3411,8 +3590,15 @@ class PageDownloader:
 
     # -- lifecycle ------------------------------------------------------------
     def cleanup(self) -> None:
+        """Bring the shared cache back under its size cap.
+
+        NOT rmtree any more: the cache is shared (another agent may still be
+        reading it) and it is worth keeping between runs - re-running the
+        same edition after a crash is the case that used to re-download
+        everything.  config.clear_run_data() removes it on exit if the user
+        has that enabled."""
         try:
-            shutil.rmtree(self._cache_dir, ignore_errors=True)
+            evict_cache()
         except Exception:
             pass
 
@@ -3456,11 +3642,12 @@ class PageDownloader:
                             break
                         parts.append(chunk)
                     data = b"".join(parts)
-                with open(cache_file, "wb") as fh:
-                    fh.write(data)
+                self._store(cache_file, data)
                 return data
             except ExtractionCancelled:
                 raise
+            except DiskFullError:
+                raise                        # never retried - see _store
             except (urllib.error.HTTPError, urllib.error.URLError,
                     TimeoutError, ConnectionError, OSError) as exc:
                 last_error = exc
@@ -3474,6 +3661,43 @@ class PageDownloader:
                         time.sleep(0.1)
                         slept += 0.1
         raise ExtractionError(f"Download failed: {url} ({last_error})")
+
+    def _store(self, cache_file: str, data: bytes) -> None:
+        """Write one page into the cache, making room first.
+
+        A cache write must never lose a page that has already been
+        downloaded: if the disk is full after eviction, the DOWNLOAD still
+        succeeded, so the caller gets its bytes and only the caching is
+        skipped.  That is what the old code got wrong - the OSError from
+        this write propagated as a failed download, was retried twice more
+        against the same full disk, and finally reported the page as
+        unavailable (which is how full-size Sandesh pages silently became
+        preview renders)."""
+        try:
+            with open(cache_file, "wb") as handle:
+                handle.write(data)
+            return
+        except OSError as exc:
+            if getattr(exc, "errno", None) != errno.ENOSPC:
+                return                       # unwritable cache is survivable
+        try:
+            os.remove(cache_file)            # a partial file helps nobody
+        except OSError:
+            pass
+        # Disk full: free the oldest cached pages and try ONCE more.
+        if evict_cache(CACHE_MAX_BYTES // 2):
+            try:
+                with open(cache_file, "wb") as handle:
+                    handle.write(data)
+                return
+            except OSError:
+                try:
+                    os.remove(cache_file)
+                except OSError:
+                    pass
+        self._reporter.log(
+            "Disk full - continuing without caching this page. Free some "
+            "space; the run will be slower until then.", "warn")
 
     def fetch_text(self, url: str, *, referer: Optional[str] = None,
                    extra_headers: Optional[Dict[str, str]] = None) -> str:
@@ -5378,7 +5602,95 @@ class NoticeDetectionPipeline:
         # --- Pass 6: veto tender / auction / recruitment look-alikes --------
         detections = self._reject_negatives(gray, detections)
         # --- Pass 7: a crop never carries the header of the notice below --
-        return self._clip_stacked_overlaps(detections)
+        detections = self._clip_stacked_overlaps(detections)
+        # --- Pass 8: apply what Half Copy taught about THIS layout --------
+        return self._apply_learned_expansion(gray, detections)
+
+    def _apply_learned_expansion(self, gray: "np.ndarray",
+                                 detections: List[Detection]
+                                 ) -> List[Detection]:
+        """Grow crops whose layout class the user has reported short.
+
+        This is the half of the feedback loop that changes future runs: two
+        Half Copy reports of the same layout bucket and the same direction
+        make every later crop of that shape reach for the next ruling line
+        by itself.  Nothing happens without that evidence - with no
+        segmentation model the whole pass is a dictionary lookup that
+        misses, which is why it is safe to run on every page.
+
+        It only ever expands to a RULING LINE, never by a fixed number of
+        pixels, and Pass 7 has already clipped stacked neighbours - so a
+        hint cannot swallow the notice below."""
+        from .utils import feedback as feedback_store
+        try:
+            model = feedback_store.load_segmentation()
+        except Exception:
+            return detections
+        if not model.get("buckets"):
+            return detections
+        inv = 1.0 / (self._scale or 1.0)
+        page_size = (gray.shape[1], gray.shape[0])
+        out: List[Detection] = []
+        for det in detections:
+            x, y, w, h = det.rect
+            try:
+                direction = feedback_store.expansion_hint(
+                    self.newspaper_name, det.method,
+                    int(w * inv), int(h * inv), page_size)
+            except Exception:
+                direction = ""
+            grown = self._grow_to_rule(gray, det.rect, direction)                 if direction else None
+            if grown is None:
+                out.append(det)
+                continue
+            self._reporter.log(
+                f"  Crop extended {direction} - learned from Half Copy",
+                "dim")
+            out.append(Detection(grown, det.score, det.method + "+learned",
+                                 det.family, det.uncertain,
+                                 getattr(det, "header_text", "")))
+        # Growing can make one crop overlap the next; the same clip that
+        # protects Pass 4's splits protects these.
+        return self._clip_stacked_overlaps(out)
+
+    def _grow_to_rule(self, gray: "np.ndarray",
+                      rect: Tuple[int, int, int, int], direction: str
+                      ) -> Optional[Tuple[int, int, int, int]]:
+        """Extend `rect` to the next ruling line in `direction`, or None."""
+        from .utils import feedback as feedback_store
+        x, y, w, h = rect
+        page_h, page_w = gray.shape[:2]
+        limit = int((h if direction in ("top", "bottom") else w)
+                    * feedback_store.SEGMENT_MAX_GROWTH)
+        if limit < 8:
+            return None
+        if self.boxes.horizontal_mask is None:
+            self.boxes.compute_line_masks(gray)
+        if direction in ("top", "bottom"):
+            band = self.boxes.horizontal_mask[:, x:min(page_w, x + w)]
+            cover = (band > 0).mean(axis=1)
+            if direction == "bottom":
+                for pos in range(min(page_h - 1, y + h + 6),
+                                 min(page_h, y + h + limit)):
+                    if cover[pos] >= 0.45:
+                        return (x, y, w, pos - y)
+            else:
+                for pos in range(max(0, y - 6), max(-1, y - limit), -1):
+                    if cover[pos] >= 0.45:
+                        return (x, pos, w, y + h - pos)
+            return None
+        band = self.boxes.vertical_mask[y:min(page_h, y + h), :]
+        cover = (band > 0).mean(axis=0)
+        if direction == "right":
+            for pos in range(min(page_w - 1, x + w + 6),
+                             min(page_w, x + w + limit)):
+                if cover[pos] >= 0.45:
+                    return (x, y, pos - x, h)
+        else:
+            for pos in range(max(0, x - 6), max(-1, x - limit), -1):
+                if cover[pos] >= 0.45:
+                    return (pos, y, x + w - pos, h)
+        return None
 
     @staticmethod
     def _clip_stacked_overlaps(detections: List[Detection]
@@ -6284,9 +6596,18 @@ class BaseNewspaperExtractor:
         return date.today() - timedelta(days=cls.days_back_limit - 1)
 
     @classmethod
+    def available_editions(cls) -> Tuple[str, ...]:
+        """The editions this paper currently publishes.
+
+        A hook, not a constant, so a paper that lists its editions online
+        (Sandesh does) can answer from the site instead of from a literal
+        that goes stale.  The default is the class attribute."""
+        return cls.editions
+
+    @classmethod
     def get_loop_editions(cls) -> Tuple[str, ...]:
         """Editions to run when looping this newspaper."""
-        return cls.loop_editions or cls.editions or (cls.default_edition,)
+        return cls.loop_editions or cls.available_editions()             or (cls.default_edition,)
 
     # -- newspaper-specific hooks --------------------------------------------
     def discover(self, downloader: PageDownloader, url: str,
@@ -6443,8 +6764,13 @@ class BaseNewspaperExtractor:
                     # The full page is only worth carrying when a zero-result
                     # diagnostic might want it; otherwise it is 22 MB held
                     # for nothing.
+                    # Working-scale page size travels with the detections:
+                    # their rects are in that space, and Half Copy needs to
+                    # know where the page ends before it expands a crop.
+                    size = (int(image.shape[1] * pipe._scale),
+                            int(image.shape[0] * pipe._scale))
                     return (image if want_debug else None), found, crops, \
-                        scores
+                        scores, size
 
                 lookahead = page_workers()
                 pool = concurrent.futures.ThreadPoolExecutor(
@@ -6474,9 +6800,11 @@ class BaseNewspaperExtractor:
                     try:
                         future = futures.pop(index, None)
                         if future is None:
-                            image, detections, crops, scores = _work(page)
+                            image, detections, crops, scores, page_size = \
+                                _work(page)
                         else:
-                            image, detections, crops, scores = future.result()
+                            image, detections, crops, scores, page_size = \
+                                future.result()
                         _pump()
                     except ExtractionCancelled:
                         raise
@@ -6543,6 +6871,9 @@ class BaseNewspaperExtractor:
                                 newspaper=self.display_name,
                                 issue_date=getattr(self, "current_issue_date",
                                                    ""),
+                                page_rect=tuple(det.rect),
+                                page_size=page_size,
+                                page_url=page.image_url or "",
                             ))
                     reporter.progress(page.page_number, total)
                 finally:
@@ -6935,7 +7266,8 @@ class NoticeCard(ttk.Frame):
                  on_click: Callable[[NoticeResult], None],
                  on_copy: Optional[Callable[[NoticeResult], None]] = None,
                  on_feedback: Optional[
-                     Callable[[NoticeResult, str], None]] = None):
+                     Callable[[NoticeResult, str], None]] = None,
+                 on_half: Optional[Callable[[NoticeResult], None]] = None):
         matched = bool(result.matched)
         super().__init__(master, relief="solid" if matched else "groove",
                          borderwidth=2, padding=6,
@@ -6987,7 +7319,25 @@ class NoticeCard(ttk.Frame):
                    command=lambda: on_save(result)).pack(side="left", padx=2)
         ttk.Button(actions, text="Copy", width=6,
                    command=lambda: on_copy(result)).pack(side="left")
+        # Half Copy: "right notice, wrong crop".  It sits with the other
+        # crop actions, NOT with the relevance question below - it is a
+        # statement about the picture, not about whether the notice belongs.
+        if on_half is not None:
+            self._half_btn = ttk.Button(
+                actions, text="Half Copy", width=10,
+                state="disabled" if result.recropped else "normal",
+                command=lambda: on_half(result))
+            self._half_btn.pack(side="left", padx=(2, 0))
+            _tooltip(self._half_btn,
+                     "The notice is right but the picture is cut short.\n"
+                     "The app looks at the page, completes the crop when "
+                     "it safely can, and learns this layout for next time.")
         row += 1
+        if result.recropped:
+            ttk.Label(self, text="Crop completed from the page",
+                      foreground="#0a6b0a").grid(row=row, column=0,
+                                                 columnspan=3, sticky="w")
+            row += 1
 
         # -- feedback ---------------------------------------------------------
         # ONE button here, deliberately.  This notice is in the results
@@ -7018,13 +7368,14 @@ class GalleryPanel(ttk.LabelFrame):
     """
 
     def __init__(self, master, on_open, on_save, on_click,
-                 on_copy=None, on_feedback=None):
+                 on_copy=None, on_feedback=None, on_half=None):
         super().__init__(master, text="Detected Public Notices")
         self._on_open = on_open
         self._on_save = on_save
         self._on_click = on_click
         self._on_copy = on_copy
         self._on_feedback = on_feedback
+        self._on_half = on_half
         #: [{"title": str, "results": [NoticeResult]}]
         self.sections: List[Dict[str, object]] = []
         #: EVERY notice from the whole run
@@ -7675,7 +8026,7 @@ class GalleryPanel(ttk.LabelFrame):
         self._empty_label.grid_forget()
         card = NoticeCard(self._inner, result, self._on_open,
                           self._on_save, self._on_click,
-                          self._on_copy, self._on_feedback)
+                          self._on_copy, self._on_feedback, self._on_half)
         if id(result) in self._deselected:
             card.selected.set(False)
         self.cards.append(card)
@@ -7759,7 +8110,8 @@ class GalleryPanel(ttk.LabelFrame):
         for result in batch:
             card = NoticeCard(self._inner, result, self._on_open,
                               self._on_save, self._on_click,
-                              self._on_copy, self._on_feedback)
+                              self._on_copy, self._on_feedback,
+                              self._on_half)
             if id(result) in self._deselected:
                 card.selected.set(False)
             self.cards.append(card)
@@ -8447,6 +8799,12 @@ class BufferedJobReporter:
         self._label = label
         self._section_title = section_title or label
         self.collected: List[NoticeResult] = []
+        #: (pages done, when).  The agent runner watches this to tell a slow
+        #: edition from a stuck one - see agents/processor.py.  A batch-wide
+        #: clock cannot: it killed agents that were still making progress
+        #: simply because other agents had been running a while.
+        self.pages_done = 0
+        self.last_progress = time.monotonic()
 
     # -- worker-facing API ----------------------------------------------------
     def check_cancel(self) -> None:
@@ -8465,10 +8823,14 @@ class BufferedJobReporter:
         pass                             # the driver owns the phase label
 
     def progress(self, current: int, total: int) -> None:
-        pass                             # the driver owns the progress bar
+        # The driver owns the progress BAR, but a page finishing is this
+        # agent's proof of life.
+        self.pages_done = current
+        self.last_progress = time.monotonic()
 
     def result(self, res: NoticeResult) -> None:
         res.section_title = self._section_title
+        self.last_progress = time.monotonic()
         self.collected.append(res)
         self._base.result(res)           # straight to the gallery, live
 
@@ -9195,6 +9557,7 @@ class Application(ttk.Frame):
         self.gallery.on_filter_change = self._drop_hidden_preview
         self.gallery._on_copy = self.copy_single
         self.gallery._on_feedback = self.on_feedback
+        self.gallery._on_half = self.on_half_crop
         paned.add(self.gallery, weight=2)
         # Top row, right of the newspaper picker - where the URL box was
         # (col 3 is the wide column; deps button keeps cols 4-5).
@@ -9389,6 +9752,7 @@ class Application(ttk.Frame):
         cls = self._current_extractor_cls()
         if cls.editions:
             self.edition_combo.configure(values=list(cls.editions))
+            self._refresh_editions_async(cls)
             current = cls.edition_from_url(self.url_var.get().strip()) \
                 or cls.default_edition
             self.edition_var.set(current)
@@ -9451,6 +9815,36 @@ class Application(ttk.Frame):
             days.append(current)
             current += timedelta(days=1)
         return days
+
+    def _refresh_editions_async(self, cls) -> None:
+        """Ask the paper for its live edition list on a worker thread.
+
+        Sandesh reads them from its own menu API; doing that inline would
+        put a network round-trip on the click that opens the dropdown."""
+        if getattr(cls, "available_editions", None) is None:
+            return
+
+        def load() -> None:
+            try:
+                editions = tuple(cls.available_editions())
+            except Exception:
+                return
+            def apply() -> None:
+                if self._current_extractor_cls() is not cls or not editions:
+                    return
+                if list(editions) == list(self.edition_combo.cget("values")):
+                    return
+                keep = self.edition_var.get()
+                self.edition_combo.configure(values=list(editions))
+                self.edition_var.set(keep if keep in editions
+                                     else cls.default_edition)
+            try:
+                self.root.after(0, apply)
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=load, daemon=True,
+                         name="editions").start()
 
     def _refresh_url(self) -> None:
         """Rebuild the URL from the selected newspaper + date.  Clamps the
@@ -9540,7 +9934,10 @@ class Application(ttk.Frame):
                 f"URL belongs to {detected_cls.display_name}; switched "
                 "newspaper selection.", "warn")
 
-        self._begin_run()
+        try:
+            self._begin_run()
+        except DiskFullError:
+            return                       # already reported to the user
         reporter = ProgressReporter(self._msg_queue, self._cancel_event)
         extractor = detected_cls(broad=False)
         extractor.current_issue_date = self._selected_date.isoformat()
@@ -9562,6 +9959,16 @@ class Application(ttk.Frame):
         own (now-orphaned) queue, so its late messages never reach the UI
         and Cancel can return control instantly."""
         self._running = True
+        # Make room BEFORE downloading anything: the disk-full failures were
+        # reported page by page, halfway through a run, as mysterious
+        # "download failed" lines.
+        try:
+            ensure_disk_space(
+                lambda text, tag="dim": self.log_panel.log(text, tag))
+        except DiskFullError as exc:
+            messagebox.showerror(APP_NAME, str(exc), parent=self.root)
+            self._running = False
+            raise
         # The notice-type toggle applies per run; the agents and their
         # template verifiers all read it at construction time.
         set_notice_type(self.notice_type_var.get())
@@ -9649,7 +10056,10 @@ class Application(ttk.Frame):
                 APP_NAME, "Nothing to extract for the chosen dates.",
                 parent=self.root)
             return
-        self._begin_run()
+        try:
+            self._begin_run()
+        except DiskFullError:
+            return                       # already reported to the user
         days = len(self._date_range())
         self.log_panel.log(
             f"Running {len(jobs)} edition(s) across {days} day(s).", "info")
@@ -9919,6 +10329,31 @@ class Application(ttk.Frame):
             self._reload_review_dialog()
             self._set_phase(f"Thanks - learned from {corrections} "
                             "correction(s)")
+        elif kind == "half_done":
+            result, direction, fixed = message[1], message[2], message[3]
+            if fixed is not None:
+                # The completed crop replaces the short one in place: same
+                # card, same position, bigger picture.  The thumbnail is
+                # rebuilt because it was made from the old pixels.
+                result.image_bgr = fixed
+                result.thumb_pil = None
+                result.recropped = True
+                result.ocr_done = False       # the text changed with the crop
+                result.ocr_words = []
+                result.ocr_text = ""
+                self.gallery.refresh_filters()
+                if getattr(self.preview, "_result", None) is result:
+                    self.preview.show_result(result)
+                self._set_phase(
+                    f"Crop completed ({direction}) - and learned for next "
+                    "time")
+            else:
+                where = ("" if direction in ("unknown", "")
+                         else f" (looks short at the {direction})")
+                self._set_phase(
+                    f"Noted{where} - learned; this crop could not be "
+                    "completed safely")
+            self._update_count()
         elif kind == "prefetched":
             # The background crop read finished: types and learned scores
             # are now filled in for every notice.  Same refresh rule as
@@ -10144,6 +10579,12 @@ class Application(ttk.Frame):
                 # The record is written before the model: the click is the
                 # evidence, and it must survive even if learning fails.
                 feedback_store.record(result, verdict, origin)
+                if verdict == "positive":
+                    # The positive half of the SEGMENTATION reward: this
+                    # crop was right, so its layout class must not drift
+                    # into "always expand" on the strength of old Half
+                    # Copy reports.
+                    feedback_store.record_crop_confirmed(result)
                 feedback_store.relearn()
                 hidden = apply_learning(results)
                 positive, negative = feedback_store.counts()
@@ -10155,6 +10596,144 @@ class Application(ttk.Frame):
         # One worker, shared by every click: two rapid clicks must append
         # and relearn in order, not race over the model file.
         self._learn_pool.submit(learn)
+
+    # -- Half Copy (segmentation feedback) ------------------------------------
+    def on_half_crop(self, result: NoticeResult) -> None:
+        """"The notice is right, the picture is cut short."
+
+        Three things happen, in this order and all off the Tk thread:
+          1. the PAGE is re-read (from the download cache, so this is a
+             decode, not a download) and asked which way the crop was cut;
+          2. when the answer is unambiguous the crop is COMPLETED to the
+             next ruling line and the card is redrawn;
+          3. the click is recorded as segmentation evidence - never as a
+             relevance negative (see utils/feedback.py).
+
+        Never a "Not Related": this notice belongs in the results, and the
+        classifier is told so."""
+        self._set_phase("Completing the crop from the page...")
+        msg_queue = self._msg_queue
+
+        def work() -> None:
+            from .utils import feedback as feedback_store
+            direction, fixed = "unknown", None
+            try:
+                page = self._page_for(result)
+                if page is not None:
+                    gray = cv2.cvtColor(page, cv2.COLOR_BGR2GRAY)
+                    scale = (result.page_size[0] / float(gray.shape[1])
+                             if result.page_size[0] else 1.0)
+                    if scale and scale != 1.0:
+                        gray = cv2.resize(
+                            gray, (result.page_size[0], result.page_size[1]),
+                            interpolation=cv2.INTER_AREA)
+                    direction = feedback_store.missing_direction(
+                        gray, result.page_rect, result.page_size)
+                    fixed = self._complete_crop(page, gray, result, direction)
+            except Exception:
+                run_logger.log("half-crop analysis failed:\n"
+                               + traceback.format_exc(), "error")
+            try:
+                if not result.ocr_done:
+                    engine = select_ocr_engine(_SilentReporter())
+                    if engine is not None:
+                        read_notice_crops([result], engine)
+                feedback_store.record_half_crop(result, direction,
+                                                result.page_size)
+                feedback_store.relearn()
+            except Exception:
+                run_logger.log("half-crop learning failed:\n"
+                               + traceback.format_exc(), "error")
+            msg_queue.put(("half_done", result, direction, fixed))
+
+        self._learn_pool.submit(work)
+
+    def _page_for(self, result: NoticeResult) -> Optional["np.ndarray"]:
+        """The full page a result was cropped from, or None.
+
+        Comes out of the shared download cache the run already filled, so
+        this is a decode rather than a download - which is exactly why the
+        cache had to stop living on a full drive."""
+        if not result.page_url or not result.page_size[0]:
+            return None
+        downloader = getattr(self, "_half_downloader", None)
+        if downloader is None:
+            downloader = PageDownloader(_SilentReporter())
+            self._half_downloader = downloader
+        return downloader.fetch_image(result.page_url)
+
+    @staticmethod
+    def _complete_crop(page_bgr: "np.ndarray", gray: "np.ndarray",
+                       result: NoticeResult, direction: str
+                       ) -> Optional["np.ndarray"]:
+        """Grow the crop to the next ruling line in `direction`.
+
+        Returns the new crop, or None when nothing safe could be done.  The
+        rule is deliberately conservative: expand to a RULING LINE (or a
+        clear run of white), never by a fixed number of pixels, and never
+        past SEGMENT_MAX_GROWTH of the crop's own size.  "Add 500 px" would
+        pull the neighbouring notice in, which is the bug one row up."""
+        from .utils import feedback as feedback_store
+        if direction not in ("top", "bottom", "left", "right"):
+            return None
+        x, y, w, h = (int(v) for v in result.page_rect)
+        if w <= 0 or h <= 0:
+            return None
+        page_h, page_w = gray.shape[:2]
+        limit = int((h if direction in ("top", "bottom") else w)
+                    * feedback_store.SEGMENT_MAX_GROWTH)
+        detector = BoxCandidateDetector(DETECTION_CONFIG)
+        detector.compute_line_masks(gray)
+        hmask, vmask = detector.horizontal_mask, detector.vertical_mask
+
+        def first_line(values, coverage, start, stop, step) -> Optional[int]:
+            for position in range(start, stop, step):
+                if 0 <= position < len(values) and values[position] >= 0.45:
+                    return position
+            return None
+
+        if direction in ("top", "bottom"):
+            band = hmask[:, x:min(page_w, x + w)]
+            cover = (band > 0).mean(axis=1)
+            if direction == "bottom":
+                edge = first_line(cover, 0.45, min(page_h - 1, y + h + 6),
+                                  min(page_h, y + h + limit), 1)
+                if edge is None:
+                    return None
+                y1 = edge
+                new = (x, y, w, y1 - y)
+            else:
+                edge = first_line(cover, 0.45, max(0, y - 6),
+                                  max(-1, y - limit), -1)
+                if edge is None:
+                    return None
+                new = (x, edge, w, y + h - edge)
+        else:
+            band = vmask[y:min(page_h, y + h), :]
+            cover = (band > 0).mean(axis=0)
+            if direction == "right":
+                edge = first_line(cover, 0.45, min(page_w - 1, x + w + 6),
+                                  min(page_w, x + w + limit), 1)
+                if edge is None:
+                    return None
+                new = (x, y, edge - x, h)
+            else:
+                edge = first_line(cover, 0.45, max(0, x - 6),
+                                  max(-1, x - limit), -1)
+                if edge is None:
+                    return None
+                new = (edge, y, x + w - edge, h)
+        nx, ny, nw, nh = new
+        if nw < w or nh < h or nw <= 0 or nh <= 0:
+            return None                    # nothing gained: leave it alone
+        inv = page_bgr.shape[1] / float(max(1, gray.shape[1]))
+        pad = DETECTION_CONFIG.crop_padding
+        x0 = int(clamp((nx - pad) * inv, 0, page_bgr.shape[1] - 1))
+        y0 = int(clamp((ny - pad) * inv, 0, page_bgr.shape[0] - 1))
+        x1 = int(clamp((nx + nw + pad) * inv, x0 + 1, page_bgr.shape[1]))
+        y1 = int(clamp((ny + nh + pad) * inv, y0 + 1, page_bgr.shape[0]))
+        result.page_rect = (nx, ny, nw, nh)
+        return page_bgr[y0:y1, x0:x1].copy()
 
     def _reload_review_dialog(self) -> None:
         """Push the current queue into an OPEN Not Sure window (learning

@@ -34,7 +34,7 @@ The "model" is therefore the sum of: embedded header **templates**, the
 
 | Newspaper | Source | Page image |
 |---|---|---|
-| Sandesh | public JSON API `new-wapi.sandesh.com/api/v1/e-paper` → CDN photos (`?w=1600`) or a whole-edition PDF (small editions) | ~2332×3231 px |
+| Sandesh | public JSON API `new-wapi.sandesh.com/api/v1/e-paper` → CDN photos, or a whole-edition PDF (small editions). Editions come from `/menu/e-paper-menu` at run time | ~2332×3231 px |
 | Gujarat Samachar | e-paper page images | per page |
 | Divya Bhaskar | e-paper PDF (login) | rendered by PyMuPDF |
 | Nav Gujarat Samay | reader page renders | per page |
@@ -238,6 +238,100 @@ classifier whose updates are gated by a reward on held-out human verdicts.
 
 ---
 
+## 6b. The segmentation learner — Half Copy
+
+The app learns **three separate things**, and mixing them is the failure mode
+this design exists to prevent:
+
+| Signal | Button | Teaches | Never teaches |
+|---|---|---|---|
+| relevance ✓ | `✓ This Is Right` (Not Sure only) | this IS a notice | — |
+| relevance ✗ | `✕ Not Related` | this is noise | — |
+| segmentation ✗ | **`Half Copy`** (on every card) | the crop was **incomplete** | that the notice was wrong |
+
+`Half Copy` means *right notice, wrong crop*.  It is recorded as
+`feedback: "half_crop"` and read by the **relevance** learner as a
+**positive** — training it as a negative would teach the classifier to reject
+the very notices it exists to find, and recall is the one number that may not
+drop.
+
+**What one click does** (all off the UI thread):
+
+1. **Re-reads the page** from the shared download cache (a decode, not a
+   download — §2a) and asks `missing_direction()` which edge was cut.
+   The test is *not* "is there ink just outside" — on a notice board there
+   always is, because the next notice is there; measured on 30 real Sandesh
+   crops that test alone called **28 of 30 complete crops short**.  The real
+   discriminator is whether the edge sits on a **printed ruling line**: a
+   complete notice ends at its own border, a cut one ends mid-text.  With the
+   rule test: **0 of 30 false alarms**, direction correct on **29 of 30**.
+2. **Completes the crop when it safely can** — grows to the *next ruling
+   line* in that direction (never a fixed "+500 px", never past
+   `SEGMENT_MAX_GROWTH` = 0.9 of the crop's own size), then redraws the card.
+   Restored the true extent on **28 of 30** deliberately truncated crops.
+3. **Records the layout pattern**, not the image: bucket =
+   `newspaper | detection path | size class | shape | column third`.
+
+**What it changes next time** — detection Pass 8
+(`_apply_learned_expansion`): once a bucket has `SEGMENT_MIN_SUPPORT` = 2
+reports of the **same** direction, every later crop of that shape reaches for
+the next ruling line by itself.  Two brakes: a bucket confirmed correct
+(`✓ This Is Right`) at least as often as reported short gets **no** hint, and
+Pass 7's stacked-overlap clip still runs afterwards, so a hint cannot swallow
+the notice below.
+
+Tracked in `data/segmentation.json` (versioned) and reported by
+`half_crop_rate()`.
+
+---
+
+## 2a. Downloads, cache and disk safety
+
+The page cache was a per-agent `tempfile.mkdtemp()` — on Windows, the system
+temp drive.  Three production failures came out of that one choice, and all
+three are the same bug wearing different hats:
+
+| Symptom in the log | Actual cause |
+|---|---|
+| `[Errno 28] No space left on device` | C: had **3.5 GB free of 280 GB** while the app's own drive had **115 GB** free |
+| `Full-size image unavailable; falling back to the preview render` | the same disk error one level up: the cache **write** failed, so the download was reported as failed and the app silently downgraded itself |
+| ten leftover `pne_cache_*` folders | cleanup ran from `atexit`, which a killed agent never reaches |
+
+Now: **one** cache at `data/cache` (same drive as the program), **shared by
+every agent** — two editions of one paper publish byte-identical notice pages
+and used to download them once each — swept of stale folders and bounded at
+`CACHE_MAX_BYTES` = 2 GB with least-recently-used eviction.  `ensure_disk_space()`
+runs **before** a run: it sweeps, evicts, and only then refuses (clearly, and
+without touching notices, feedback, learning or settings).  A cache write that
+still fails after eviction no longer fails the download — the bytes are already
+in hand, so the page is used and only the caching is skipped.
+
+**Sandesh has no "preview" rendition.**  Measured 2026-08-19 on page 1 of the
+Ahmedabad edition: `?w=300`, `?w=800`, `?w=1600`, `?w=2400` and no parameter
+at all all return the **same 1,656,142 bytes** — the CDN ignores the
+parameter.  So the width was dropped (one canonical URL per page, no thumb
+variant, no duplicate cache entry) and the preview fallback deleted: a failure
+here is a real failure and is now reported as one.
+
+---
+
+## 4b. Agents, stalls and preserved work
+
+`AGENT_TIMEOUT_SECONDS = 900` was **one deadline for the whole batch**, set
+once before the first agent started and checked for every agent still
+running.  That is why two different newspapers reported `TIMEOUT after 900s`
+in the same second, both mid-edition and both still publishing notices.
+
+Replaced by a **stall watchdog**: `BufferedJobReporter` timestamps every
+finished page and every published notice, and an agent is abandoned only after
+`AGENT_STALL_SECONDS` = 240 s with **no progress of its own** (with a generous
+`AGENT_TIMEOUT_SECONDS` = 2400 s backstop).  A slow edition now finishes; only
+a genuinely stuck one is dropped, alone, and everything it already published
+is kept and counted.  Regression test:
+`test_a_stalled_agent_does_not_kill_the_others`.
+
+---
+
 ## 7. How accuracy is measured (`tools/`)
 
 ```
@@ -302,6 +396,14 @@ search, review, resize, shutdown) all sections PASS.
 | MIN_SUPPORT / MIN_RATIO / MIN_TOKEN_LEN | 3 / 3.0 / 4 | feedback | text learning guards |
 | REGION_MIN_SUPPORT / REGION_WEIGHT_CAP | 4 / 0.9 | feedback | layout learning guards |
 | DEMOTE_SCORE / PROMOTE_SCORE / PROTECT_CONFIDENCE | 1.5 / 2.0 / 88 | feedback | apply thresholds |
+| SEGMENT_MIN_SUPPORT | 2 | feedback | half-crop reports before a hint applies |
+| SEGMENT_MAX_GROWTH | 0.9 | feedback | cap on a learned expansion |
+| SEGMENT_INK_MIN | 0.02 | feedback | ink that counts as "more notice here" |
+| CACHE_MAX_BYTES | 2 GB | core | page-cache size cap (LRU eviction) |
+| DISK_MIN_FREE_BYTES | 500 MB | core | preflight free-space floor |
+| AGENT_STALL_SECONDS | 240 | core | no-progress window before an agent is dropped |
+| AGENT_TIMEOUT_SECONDS | 2400 | core | per-agent backstop (was a 900 s batch clock) |
+| CROP_OCR_UPSCALE / _MAX_SIDE | 1.5 / 1600 px | core | whole-crop OCR upscale |
 | pill grow window / band rule test | ≤ 52 px / interior vertical ink > 35 % | core `_grow_to_notice` | Sandesh pills |
 | trim-to-cell | header ≤ 45 % of box width, rule within 1.6× header width | core | mixed boxes |
 | overlap clip | ≤ 25 % of upper crop's height, ≥ 90 px left | core | Pass 7 |
@@ -315,6 +417,8 @@ search, review, resize, shutdown) all sections PASS.
 | data/feedback.jsonl | every click (evidence) | yes |
 | data/learned.json | the learned model + last 5 versions | yes |
 | data/learning_history.jsonl | every relearn decision with metrics | yes |
+| data/segmentation.json | Half Copy layout hints, versioned | yes |
+| data/cache/ | downloaded pages, LRU-evicted at 2 GB | until exit |
 | data/validation_history.jsonl | every scored validation run | yes |
 | data/recent_searches.json | search history | yes |
 | data/logs/, cache/, debug/ | run leftovers | cleared on exit |

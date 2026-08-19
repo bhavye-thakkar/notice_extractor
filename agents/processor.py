@@ -162,26 +162,39 @@ def run_jobs(jobs: Sequence[Job], reporter: "core.ProgressReporter", *,
             # Handled in COMPLETION order: a paper that finishes early reports
             # right away instead of waiting behind a slow one.
             done = 0
-            deadline = time.monotonic() + core.AGENT_TIMEOUT_SECONDS
+            started_at = time.monotonic()
             pending = set(futures)
             while pending:
                 reporter.check_cancel()
                 finished, pending = concurrent.futures.wait(
                     pending, timeout=1.0, return_when="FIRST_COMPLETED")
                 if not finished:
-                    if time.monotonic() > deadline:
-                        for future in pending:
-                            _job, title = futures[future]
-                            future.cancel()
-                            kept = _salvage(title, _job[0])
-                            tail = (f" - keeping the {kept} notice(s) it had "
-                                    "already found") if kept else ""
-                            reporter.log(
-                                f"[Agent] {title} -> TIMEOUT after "
-                                f"{core.AGENT_TIMEOUT_SECONDS}s, abandoned"
-                                f"{tail}", "error")
-                            summary.skipped.append(title)
-                        break
+                    # Abandon only the agents that have STOPPED, one by one.
+                    # The old code shared a single batch deadline, so a long
+                    # run killed every agent still working - including ones
+                    # that were half way through an edition and still
+                    # publishing notices.
+                    now = time.monotonic()
+                    stalled = []
+                    for future in pending:
+                        _job, title = futures[future]
+                        buffered = live.get(title)
+                        quiet = now - (buffered.last_progress
+                                       if buffered is not None else started_at)
+                        if quiet > core.AGENT_STALL_SECONDS or                                 now - started_at > core.AGENT_TIMEOUT_SECONDS:
+                            stalled.append((future, title, _job, quiet,
+                                            buffered))
+                    for future, title, _job, quiet, buffered in stalled:
+                        future.cancel()
+                        pages = buffered.pages_done if buffered else 0
+                        kept = _salvage(title, _job[0])
+                        tail = (f" - keeping the {kept} notice(s) from the "
+                                f"{pages} page(s) it finished") if kept else ""
+                        reporter.log(
+                            f"[Agent] {title} -> no progress for "
+                            f"{quiet:.0f}s, abandoned{tail}", "error")
+                        summary.skipped.append(title)
+                        pending.discard(future)
                     continue
 
                 for future in finished:

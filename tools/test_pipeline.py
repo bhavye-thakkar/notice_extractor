@@ -2476,6 +2476,180 @@ def test_browser_session_is_optional():
     print("ok  browser session helpers work without launching a browser")
 
 
+def test_half_copy_is_not_a_rejection():
+    """Half Copy teaches SEGMENTATION, never that the notice was wrong.
+
+    Training a half crop as a relevance negative would teach the classifier
+    to reject the notices it exists to find - the recall bug this whole
+    split of signals is here to prevent."""
+    import tempfile
+    from notice_extractor import config
+    from notice_extractor.utils import feedback as fb
+
+    folder = tempfile.mkdtemp(prefix="pne-half-")
+    original = config.DATA_DIR
+    config.DATA_DIR = folder
+    try:
+        text = ("આથી જાહેર જનતાને જણાવવાનું કે સદરહુ મિલકત અંગે "
+                "કોઈપણ પ્રકારનો હક્ક હિસ્સો")
+        result = _feedback_result(pne, text, confidence=70)
+        result.newspaper = "Sandesh"
+        result.method = "box+template"
+        result.page_rect = (100, 200, 300, 400)
+        result.page_size = (1500, 2000)
+
+        fb.record_half_crop(result, "bottom", (1500, 2000))
+        records = fb.load_records()
+        assert len(records) == 1, records
+        assert records[0]["feedback"] == "half_crop"
+        assert records[0]["direction"] == "bottom"
+        assert records[0]["crop"]["width"] == 300, records[0]["crop"]
+        assert records[0]["page_dimensions"]["height"] == 2000
+
+        # ...and the CLASSIFIER reads it as a positive, not a negative.
+        model = fb.build_model(records)
+        assert model["negative_examples"] == 0, model
+        assert model["positive_examples"] == 1, model
+        assert fb.score(records[0]["normalized_text"], model) == 0.0
+
+        # One report is not a rule; two of the same kind are.
+        assert fb.expansion_hint("Sandesh", "box+template", 300, 400,
+                                 (1500, 2000)) == ""
+        fb.record_half_crop(result, "bottom", (1500, 2000))
+        assert fb.expansion_hint("Sandesh", "box+template", 300, 400,
+                                 (1500, 2000)) == "bottom"
+        # A confirmed crop in the same class withdraws the hint.
+        fb.record_crop_confirmed(result)
+        fb.record_crop_confirmed(result)
+        assert fb.expansion_hint("Sandesh", "box+template", 300, 400,
+                                 (1500, 2000)) == ""
+        half, total, rate = fb.half_crop_rate()
+        assert (half, total) == (2, 2) and rate == 1.0, (half, total, rate)
+    finally:
+        config.DATA_DIR = original
+        shutil.rmtree(folder, ignore_errors=True)
+    print("ok  half copy trains segmentation, never relevance")
+
+
+def test_missing_direction_needs_an_unruled_edge():
+    """A crop that ends on its own printed border is COMPLETE.
+
+    "Is there ink just outside?" is not the question - on a notice board
+    there always is, because the next notice is there.  Measured on 30 real
+    Sandesh crops, that test alone called 28 of 30 complete crops short."""
+    import numpy as np
+    from notice_extractor.utils import feedback as fb
+
+    # A page at the size detection actually works on (1500 px wide): the
+    # ruling-line morphology scales with the page, so a toy 400 px page
+    # classifies ordinary words as rules and the fixture proves nothing.
+    page = np.full((2000, 1500), 255, dtype=np.uint8)
+    cv2 = pne.cv2
+    for top in (100, 800):
+        cv2.rectangle(page, (100, top), (400, top + 600), 0, 3)
+        for line in range(22):
+            y = top + 22 + line * 26
+            if y > top + 590:
+                break
+            for word in range(5):
+                x = 116 + word * 60
+                cv2.line(page, (x, y), (x + 40, y), 0, 7)
+    complete = (100, 100, 300, 600)
+    assert fb.missing_direction(page, complete, (1500, 2000)) == "unknown", \
+        "a fully ruled crop was called incomplete"
+    # The same notice cut short: no rule under it, its own text continues.
+    short = (100, 100, 300, 380)
+    assert fb.missing_direction(page, short, (1500, 2000)) == "bottom", \
+        "a crop cut mid-text was not spotted"
+    print("ok  missing direction needs an unruled edge, not just nearby ink")
+
+
+def test_a_stalled_agent_does_not_kill_the_others():
+    """The 900 s timeout bug: ONE batch deadline abandoned every agent that
+    was still running, mid-edition, still publishing notices."""
+    import queue as _queue
+    import threading as _threading
+    from datetime import date as _date
+    from notice_extractor.agents import processor
+
+    stall, ceiling = pne.AGENT_STALL_SECONDS, pne.AGENT_TIMEOUT_SECONDS
+    pne.AGENT_STALL_SECONDS, pne.AGENT_TIMEOUT_SECONDS = 3, 60
+
+    def make(name, behaviour):
+        class Fake(pne.BaseNewspaperExtractor):
+            display_name = name
+            editions = ("e1",)
+            default_edition = "e1"
+
+            def __init__(self, broad=False):
+                self.current_issue_date = ""
+
+            def extract_all(self, pairs, reporter, finalize=True,
+                            start_result_id=0):
+                behaviour(reporter)
+        return Fake
+
+    def alive(reporter):
+        for page in range(1, 7):
+            time.sleep(1.0)
+            reporter.progress(page, 6)      # proof of life
+        reporter.result(pne.NoticeResult(
+            result_id=1, page_number=1, index_on_page=1, image_bgr=None,
+            confidence=70, method="x"))
+
+    def stuck(reporter):
+        time.sleep(45)
+
+    try:
+        messages = _queue.Queue()
+        reporter = pne.ProgressReporter(messages, _threading.Event())
+        jobs = [(make("SlowPaper", alive), "e1", _date.today(), "u"),
+                (make("StuckPaper", stuck), "e1", _date.today(), "u")]
+        started = time.perf_counter()
+        summary = processor.run_jobs(jobs, reporter)
+        elapsed = time.perf_counter() - started
+        assert summary.total == 1, \
+            f"the live agent's work was thrown away ({summary.total})"
+        assert len(summary.skipped) == 1 and \
+            "StuckPaper" in summary.skipped[0], summary.skipped
+        assert elapsed < 25, f"waited far too long: {elapsed:.0f}s"
+    finally:
+        pne.AGENT_STALL_SECONDS, pne.AGENT_TIMEOUT_SECONDS = stall, ceiling
+    print("ok  a stalled agent is dropped alone; live agents keep their work")
+
+
+def test_cache_lives_on_the_apps_own_drive_and_is_bounded():
+    """The disk-full failures: the cache used to go to the system temp
+    drive and was only cleaned by atexit (which a killed agent never runs)."""
+    import tempfile
+    from notice_extractor import config
+
+    folder = tempfile.mkdtemp(prefix="pne-cache-")
+    original = config.DATA_DIR
+    config.DATA_DIR = folder
+    try:
+        cache = pne.cache_dir()
+        assert os.path.abspath(cache).startswith(os.path.abspath(folder)), \
+            f"cache escaped the data folder: {cache}"
+        for index in range(6):
+            with open(os.path.join(cache, f"page{index}"), "wb") as handle:
+                handle.write(b"x" * 1024)
+        assert pne.cache_bytes() >= 6 * 1024
+        freed = pne.evict_cache(2 * 1024)
+        assert freed >= 4 * 1024, freed
+        assert pne.cache_bytes() <= 2 * 1024, pne.cache_bytes()
+        # Nothing outside the cache is ever a candidate.
+        keep = os.path.join(folder, "feedback.jsonl")
+        with open(keep, "w", encoding="utf-8") as handle:
+            handle.write("{}")
+        pne.evict_cache(0)
+        assert os.path.exists(keep), "eviction touched user data"
+    finally:
+        config.DATA_DIR = original
+        shutil.rmtree(folder, ignore_errors=True)
+    print("ok  page cache is on the app's drive, bounded, and never eats data")
+
+
 def main() -> int:
     tests = [
         test_notice_type_toggle_filters_matching,
@@ -2523,6 +2697,10 @@ def main() -> int:
         test_page_budget_is_shared_not_multiplied,
         test_machine_junk_stays_out_of_the_project,
         test_browser_session_is_optional,
+        test_half_copy_is_not_a_rejection,
+        test_missing_direction_needs_an_unruled_edge,
+        test_a_stalled_agent_does_not_kill_the_others,
+        test_cache_lives_on_the_apps_own_drive_and_is_bounded,
         test_newspaper_plugins_load,
         test_plugins_have_no_dangling_names,
         test_plugin_loader_is_idempotent,

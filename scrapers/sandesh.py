@@ -29,7 +29,25 @@ from notice_extractor.core import *  # noqa: F401,F403  - shared infrastructure
 
 SANDESH_API_EPAPER = "https://new-wapi.sandesh.com/api/v1/e-paper"
 SANDESH_CDN_BASE = "https://epapercdn.sandesh.com/"
-SANDESH_PAGE_WIDTH = 1600          # px width requested per page image
+#: Menu endpoint listing every published edition slug (read at run time so a
+#: new supplement does not need a code change - see sandesh_editions()).
+SANDESH_API_MENU = "https://new-wapi.sandesh.com/api/v1/menu/e-paper-menu"
+
+# The "?w=<px>" the e-paper's own JS appends is IGNORED by the CDN: measured
+# 2026-08-19 on page 1 of the Ahmedabad edition, w=300, w=800, w=1600, w=2400
+# and no parameter at all every returned the SAME 1,656,142 bytes - the
+# full-resolution original (2332x3231).  Two consequences, both of them bugs
+# that were live in production:
+#
+#   * there is no such thing as a Sandesh "preview render".  The fallback that
+#     logged "Full-size image unavailable; falling back to the preview render"
+#     was re-downloading the identical file under a different URL string - a
+#     second 1.6 MB fetch, a second cache entry, and a log line that blamed
+#     the newspaper for what was actually a local disk error.
+#   * asking for a width was pure cache fragmentation: the same page cached
+#     twice because "?w=1600" and "?w=300" are different keys.
+#
+# So: ONE canonical URL per page, no width parameter, no thumb variant.
 
 SANDESH_URL_PATTERN = re.compile(
     r"^https?://(?:www\.)?sandesh\.com/epaper/"
@@ -91,10 +109,10 @@ def _sandesh_http(url: str, timeout: int = 20) -> Tuple[Optional[str], str]:
     return None, last
 
 
-def _sandesh_page_url(photo: str, width: int) -> str:
-    """CDN URL for one page photo path at the requested render width."""
-    path = photo.split("?")[0].lstrip("/")
-    return f"{SANDESH_CDN_BASE}{path}?w={width}"
+def _sandesh_page_url(photo: str) -> str:
+    """The one canonical CDN URL for a page photo path (see the note above:
+    the CDN serves the full-resolution original whatever ?w= says)."""
+    return f"{SANDESH_CDN_BASE}{photo.split('?')[0].lstrip('/')}"
 
 
 def _sandesh_photos_from_payload(text: str
@@ -127,6 +145,73 @@ def _sandesh_photos_from_payload(text: str
                 pdf_path = pdf.strip()
                 break
     return photos, pdf_path, str(payload.get("message") or "")
+
+
+#: Editions the app offers when the menu cannot be read (office network
+#: down, API moved).  The Ahmedabad group, which is what is monitored for
+#: notices - the live list from sandesh_editions() supersedes it.
+SANDESH_FALLBACK_EDITIONS: Tuple[str, ...] = (
+    "ahmedabad", "ahmedabad-east", "city-life",
+    "zalawad---ahmedabad-dist", "gandhinagar", "kheda", "mehsana",
+    "sabarkantha", "patan", "banaskantha", "ahmedabad-special-edition",
+)
+#: Which top-level menu group the app extracts.  Sandesh publishes Surat,
+#: Rajkot, Vadodara ... too; the notices being monitored are the Ahmedabad
+#: ones, and offering 40 editions nobody scans is not a feature.
+SANDESH_MENU_GROUP = "ahmedabad"
+#: (editions, when) - the menu is fetched at most once per process.
+_EDITIONS_CACHE: List[Tuple[str, ...]] = []
+
+
+def _menu_slugs(payload: str, group: str) -> Tuple[str, ...]:
+    """Edition slugs of one menu group, in the order the site lists them.
+
+    The slug the e-paper API wants is the entry's "category" - NOT its
+    "name" ("Ahmedabad City" -> "ahmedabad") and not the top-level group's
+    own category ("Ahmedabad" -> "ahmedabad-city", which is a different
+    edition).  Both mistakes produce a plausible URL that 404s at run time,
+    so the parse is written against the real payload shape."""
+    try:
+        data = json.loads(payload)
+    except ValueError:
+        return ()
+    data = data.get("data", data) if isinstance(data, dict) else data
+    if not isinstance(data, dict):
+        return ()
+    slugs: List[str] = []
+    for entry in data.values():
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name") or "").strip().lower()
+        if group and group not in name:
+            continue
+        submenu = entry.get("submenu")
+        items = submenu.values() if isinstance(submenu, dict) else []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            slug = str(item.get("category") or "").strip().lower()
+            if slug and slug not in slugs:
+                slugs.append(slug)
+        if slugs:
+            break                     # the group we wanted
+    return tuple(slugs)
+
+
+def sandesh_editions() -> Tuple[str, ...]:
+    """Every edition Sandesh currently publishes in the monitored group.
+
+    Read from the site's own menu so a new supplement needs no code change;
+    falls back to the known list when the network says no.  Cached for the
+    life of the process - this is a dropdown, not a feed."""
+    if _EDITIONS_CACHE:
+        return _EDITIONS_CACHE[0]
+    text, _error = _sandesh_http(SANDESH_API_MENU, timeout=12)
+    slugs = _menu_slugs(text, SANDESH_MENU_GROUP) if text else ()
+    if not slugs:
+        slugs = SANDESH_FALLBACK_EDITIONS
+    _EDITIONS_CACHE.append(slugs)
+    return slugs
 
 
 def sandesh_discover_pages(downloader: PageDownloader, url: str,
@@ -167,8 +252,9 @@ def sandesh_discover_pages(downloader: PageDownloader, url: str,
     for index, photo in enumerate(photos[:SANDESH_MAX_PAGES], start=1):
         pages.append(PageRef(
             page_number=index,
-            image_url=_sandesh_page_url(photo, SANDESH_PAGE_WIDTH),
-            thumb_url=_sandesh_page_url(photo, 300),
+            image_url=_sandesh_page_url(photo),
+            # No thumb: it would be the same bytes under a second URL.
+            thumb_url=None,
             page_html_url=(f"https://sandesh.com/epaper/{edition}"
                            f"?date={date_str}&page={index}"),
         ))
@@ -182,16 +268,12 @@ def sandesh_get_page_image(downloader: PageDownloader, page: PageRef,
         # PDF-published edition (see sandesh_discover_pages): the ref points
         # at the downloaded file, render the page locally.
         return pdf_render_page(page.page_html_url, page.page_number)
-    try:
-        return downloader.fetch_image(page.image_url,
-                                      referer=page.page_html_url)
-    except ExtractionError:
-        if page.thumb_url:
-            reporter.log("  Full-size image unavailable; falling back to "
-                         "the preview render.", "warn")
-            return downloader.fetch_image(page.thumb_url,
-                                          referer=page.page_html_url)
-        raise
+    # No preview fallback: Sandesh has only one rendition (see the note at
+    # the top of this file), so a failure here is a real failure - a dead
+    # link, a network problem or a full disk - and must be reported as one
+    # rather than dressed up as a lower-quality success.
+    return downloader.fetch_image(page.image_url,
+                                  referer=page.page_html_url)
 
 
 class SandeshPipeline(NoticeDetectionPipeline):
@@ -208,8 +290,13 @@ class SandeshExtractor(BaseNewspaperExtractor):
     display_name = "Sandesh"
     days_back_limit = None       # archive allows any past date
     pipeline_cls = SandeshPipeline
-    # Only the three editions that are actually monitored for notices.
-    editions = ("ahmedabad", "ahmedabad-east", "gandhinagar")
+    #: Filled from the site's own menu on first use (sandesh_editions()).
+    editions = SANDESH_FALLBACK_EDITIONS
+
+    @classmethod
+    def available_editions(cls) -> Tuple[str, ...]:
+        cls.editions = sandesh_editions()
+        return cls.editions
 
     @classmethod
     def matches(cls, url: str) -> bool:
